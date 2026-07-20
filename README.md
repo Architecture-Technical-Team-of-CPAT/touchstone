@@ -129,7 +129,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Architecture-Technical-Team-of-CPAT/touchstone
-          ref: v1                      # 锁定版本
+          ref: v0.1.0                      # 锁定版本
           path: .touchstone-src
       - name: Run review
         env:
