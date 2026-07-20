@@ -128,7 +128,7 @@ jobs:
       - name: Checkout Touchstone
         uses: actions/checkout@v4
         with:
-          repository: AKDI-SE/touchstone
+          repository: Architecture-Technical-Team-of-CPAT/touchstone
           ref: v1                      # 锁定版本
           path: .touchstone-src
       - name: Run review
