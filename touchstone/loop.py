@@ -19,7 +19,7 @@ from typing import Optional
 from touchstone import checklist as _checklist   # 单一签名构造源（_sig 委派 sig_of，保持同构）
 
 try:
-    MAX_ROUNDS = max(1, int(os.environ.get("TOUCHSTONE_MAX_ROUNDS", "9")))
+    MAX_ROUNDS = max(1, int((os.environ.get("TOUCHSTONE_MAX_ROUNDS") or "").strip() or "9"))
 except (TypeError, ValueError):
     # 坏值（空串/非数字）→ 默认 9，绝不在 import 时崩整链。对齐 num_retries/max_lines 的 env 兜底
     # 风格——独此常量原本无兜底：env="" 或 "abc" 在导入时 ValueError → touchstone.loop import

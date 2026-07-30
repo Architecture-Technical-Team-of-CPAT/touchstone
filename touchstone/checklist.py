@@ -271,6 +271,8 @@ def render(checklist, rounds_left=None, lineage=None):
         lines.append(f"  - 位置：`{loc}`")
         if it["note"]:
             lines.append(f"  - 说明：{it['note']}")
+        if it.get("guard"):                    # 守卫事实（issue #139）：确定性 AST 事实，
+            lines.append(f"  - 守卫事实：{it['guard']}")   # 供 waived 申报佐证与人工核对
         lines.append(f"  <sub>锚点 `{it['sig']}`</sub>")
     lines.append("")
     if cl["items"]:

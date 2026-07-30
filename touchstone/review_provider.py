@@ -96,7 +96,7 @@ class ReviewEngineDegraded(RuntimeError):
 
 # 可疑空收敛阈值（改动新增行 >= 此值 且 LLM 0 原始建议 -> 评审不可信）。
 # 与 orchestrator._clean_review_trace 的 suspicious 判据同源；经 env 可调（如超大 PR 调参）。
-_SUSPICIOUS_EMPTY_LINES = int(os.environ.get("TOUCHSTONE_SUSPICIOUS_EMPTY_LINES", "20") or 20)
+_SUSPICIOUS_EMPTY_LINES = int((os.environ.get("TOUCHSTONE_SUSPICIOUS_EMPTY_LINES") or "").strip() or "20")
 
 
 def review_reliable(engine_status, ai_raw_count, added_lines, engaged=False):
@@ -370,7 +370,8 @@ def load_nmap(repo_dir="."):
     path = os.environ.get("TOUCHSTONE_PRAGENT", os.path.join(repo_dir, ".touchstone", "pr-agent.yaml"))
     nmap = dict(_DEFAULT_NMAP)
     try:
-        data = yaml.safe_load(open(path, encoding="utf-8")) or {}
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
         norm = data.get("normalization", {})
         # 浅合并：用户配置覆盖默认（label 映射整体替换以避免歧义）
         for k in ("default_category", "default_severity", "default_confidence", "conf_min", "high_categories"):
@@ -453,7 +454,8 @@ def _build_pr_url(pr_ctx):
 
 def _load_provider_cfg(repo_dir):
     try:
-        d = yaml.safe_load(open(os.path.join(repo_dir, ".touchstone", "pr-agent.yaml"), encoding="utf-8")) or {}
+        with open(os.path.join(repo_dir, ".touchstone", "pr-agent.yaml"), encoding="utf-8") as f:
+            d = yaml.safe_load(f) or {}
         return d.get("provider") or {}
     except OSError:
         return {}
@@ -480,7 +482,27 @@ def _experience_injection(repo_dir):
         return ""
     try:
         from touchstone import learning_loop
-        return learning_loop.render_injection(learning_loop.load_store()) or ""
+        # include_shadow 透传：env TOUCHSTONE_SHADOW_INJECTION 开时，active 段后追加 shadow candidate
+        # 段（advisory only、文本标灰）。shadow 与 active 读同一 store、同一 EXPERIENCE_REF 防投毒闸——
+        # 上方 L473-480 未配受信 ref 即整体返回 ""（含 shadow），candidate 也走受信 ref（铁律 5）。
+        # 时序耦合：须与 orchestrator marker 归因（step3）读同一开关，否则 marker 说"注入了 shadow X"
+        # 但此处未渲染 → with 臂归因失真；两处 env 默认关 = 字节级等价现状。
+        # _shadow_injection_enabled() 独立求值 + 安全降级（pr-agent #118 r1）：它抛异常时降级 False
+        # （只禁 shadow 段），不级联进外层 except 禁用整个经验注入含 active（与 step3 :504 同类隔离）。
+        try:
+            include_shadow = learning_loop._shadow_injection_enabled()
+        except Exception as _e:
+            # 诊断不静默（pr-agent #118 r2）：shadow 开关求值出错时仍降级 False（active 不受影响），
+            # 但打 stderr 告警——运维能看到 shadow 段被关的原因（CLAUDE.md §3 诚实标 gap、不掩盖问题；
+            # 与上方 L477-479 跳过注入告警同款 [warn] print 模式）。
+            import sys as _sys
+            print(f"[warn] _shadow_injection_enabled() 求值失败 → 降级 include_shadow=False"
+                  f"（shadow 段关闭、active 注入不受影响）：{_e}", file=_sys.stderr)
+            include_shadow = False
+        return learning_loop.render_injection(
+            learning_loop.load_store(),
+            include_shadow=include_shadow,
+        ) or ""
     except Exception:
         return ""
 
@@ -738,11 +760,30 @@ class PRAgentProvider:
         cmd = shlex.split(os.environ.get("TOUCHSTONE_PRAGENT_CMD", "python -m touchstone.pr_agent_runner"))
         base_mode = _provider_mode(pr_ctx)            # improve+review（默认）/ improve / review
         repo_dir = pr_ctx.get("repo_dir", ".")
-        timeout = int(os.environ.get("TOUCHSTONE_PRAGENT_TIMEOUT", "600"))
+        timeout = int((os.environ.get("TOUCHSTONE_PRAGENT_TIMEOUT") or "").strip() or "600")
         # best_practices.md 不经此传：pr-agent 的本地 best_practices 是文件式——放到被审仓库根即可。
         extra = pr_ctx.get("extra_instructions")
         if extra is None:
             extra = _experience_injection(repo_dir)   # 学习回路 active 经验 → extra_instructions（只读、可空）
+        # 守卫上下文注入（issue #139 方案 B/C，与经验注入同边界：只调建议、失败即空）：
+        #   B 生成侧——本次变更 hunk 的守卫摘要，降低「看 hunk 不看守卫」型误报产出；
+        #   C 判后核销——上轮未销项的守卫事实（orchestrator 预取入 pr_ctx），守卫已覆盖的
+        #     FP 本轮不再被重报 → 签名不再现 → reconcile 既有机制自动销项。
+        try:
+            from touchstone import guard_context as _gc_gate
+            _guard_on = _gc_gate.enabled()               # 总开关单一判定（PR#140 R2 意见 3）
+        except Exception:
+            _guard_on = False
+        if _guard_on:
+            try:
+                from touchstone import guard_context
+                _gsegs = [guard_context.render_guard_digest(pr_ctx.get("diff") or "", repo_dir),
+                          pr_ctx.get("guard_adjudication") or ""]
+                _gtxt = "\n\n".join(x for x in _gsegs if x)
+                if _gtxt:
+                    extra = (extra + "\n\n" + _gtxt) if extra else _gtxt
+            except Exception:
+                pass    # 静默豁免：守卫注入是纯增强，失败即空段；抛出会拖垮评审链路（与经验注入同款边界）
         tmp = None
         try:
             if extra:

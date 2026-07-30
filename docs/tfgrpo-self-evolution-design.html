@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Touchstone · TF-GRPO 自进化闭环设计</title>
+<style>
+  :root{
+    --paper:#FAFAF8; --panel:#FFFFFF; --ink:#15181D; --muted:#6B7178;
+    --line:#E6E4DD; --line2:#D8D6CD;
+    --primary:#14506B; --c1:#0E7C7B; --c2:#3D52A0; --c3:#B5651D;
+    --high:#A23E3E; --good:#0E7C7B;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:var(--paper); color:var(--ink); font-family:var(--sans); font-size:16px; line-height:1.66; -webkit-font-smoothing:antialiased}
+  .wrap{max-width:920px; margin:0 auto; padding:0 24px}
+  header.hero{padding:60px 0 38px; border-bottom:1px solid var(--line)}
+  .eyebrow{font-family:var(--mono); font-size:12px; letter-spacing:.22em; text-transform:uppercase; color:var(--primary); margin:0 0 18px}
+  h1{font-size:38px; line-height:1.14; font-weight:760; letter-spacing:-.018em; margin:0 0 18px}
+  .thesis{font-size:18px; line-height:1.56; max-width:44em; margin:0 0 24px}
+  .thesis b{color:var(--primary)}
+  .meta{font-size:13px; color:var(--muted); font-family:var(--mono); line-height:1.9}
+  .meta b{color:var(--ink); font-weight:600}
+  section{padding:44px 0; border-bottom:1px solid var(--line)}
+  .snum{font-family:var(--mono); font-size:13px; color:var(--primary); letter-spacing:.04em}
+  h2{font-size:26px; font-weight:720; letter-spacing:-.012em; margin:6px 0 18px}
+  h3{font-size:17px; font-weight:680; margin:22px 0 8px; font-family:var(--mono)}
+  p{margin:0 0 14px}
+  strong{font-weight:670}
+  code{font-family:var(--mono); font-size:.9em; background:#F1F0EA; padding:1px 6px; border-radius:4px; color:#2a2d33}
+  ul,ol{margin:0 0 14px; padding-left:1.25em} li{margin:6px 0}
+  .muted{color:var(--muted)}
+  .principle{margin:16px 0; padding:14px 18px; border-left:3px solid var(--primary); background:#F3F6F8; border-radius:0 7px 7px 0}
+  .principle .k{font-family:var(--mono); font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--primary); display:block; margin-bottom:6px}
+  .principle.warn{border-left-color:var(--high); background:#FAF1F0}
+  .principle.warn .k{color:var(--high)}
+  .principle.good{border-left-color:var(--good); background:#EAF1F4}
+  .principle.good .k{color:var(--good)}
+  blockquote.note{margin:14px 0; padding:12px 16px; background:#FAF6EE; border:1px solid var(--line); border-radius:7px; color:#4a4030; font-size:14.5px}
+  blockquote.note b{color:var(--c3)}
+  .tbl{width:100%; border-collapse:collapse; margin:16px 0; font-size:14px}
+  .tbl th,.tbl td{border:1px solid var(--line2); padding:9px 11px; text-align:left; vertical-align:top}
+  .tbl th{background:#F1F0EA; font-weight:640; font-size:12.5px}
+  .tbl .mono{font-family:var(--mono); font-size:12.5px; color:#2a2d33}
+  .tbl td.ok{color:var(--good); font-weight:640}
+  .tbl td.no{color:var(--high); font-weight:640}
+  .tbl td.mid{color:var(--c3); font-weight:640}
+  footer{padding:36px 0 72px; color:var(--muted); font-size:13px; font-family:var(--mono)}
+  @media (max-width:700px){h1{font-size:28px}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">专项设计 · TF-GRPO 自进化闭环</p>
+    <h1>TF-GRPO 自进化闭环设计</h1>
+    <p class="thesis">TF-GRPO 的机制骨架已实现且对齐设计，<code>docs/learning-loop-design.html §3.6</code> 的生产化差距清单是<b>「差距地图」而非「施工图」</b>。本设计把三块设计盲区补成施工级，核心是<b>破冷启动死锁</b>——让 candidate 经验真能自动转 active、自进化闭环真正转起来，同时守住 advisory-only 红线。</p>
+    <p class="meta">
+      <b>设计对象</b>　冷启动死锁破局（详）· 坏真值检测（中）· 运行编排（降级说明）<br>
+      <b>日期</b>　2026-07-20<br>
+      <b>依据</b>　精读 <code>experience_store.py / ground_truth.py / learning_loop.py / orchestrator.py / distill.py</code> + <code>learn.yml</code> + <code>audit-tfgrpo.html</code> + <code>learning-loop-design.html §3</code><br>
+      <b>产出</b>　设计文档（A-lane）；代码实施按 §2.7 的 6 步另开 PR
+    </p>
+  </div>
+</header>
+
+<section style="padding:24px 0">
+  <div class="wrap">
+    <div class="principle good" style="margin:0"><span class="k" style="color:#0E7C7B">定位（与 §3.6 的关系）</span>
+    本设计是 <code>learning-loop-design.html §3.6</code> 的<b>施工化补充</b>，不替代它：§3.6 第 1 类（奖励质量）与第 5 类（真值清洗）的留白，在此分别由<b>盲区 1（冷启动）</b>和<b>盲区 2（坏真值）</b>给出可施工方案；第 3-4 类（收敛/成本）见 §4 降级说明。骨架机制（I1–I4 / 数据管线 / 门控）<b>已实现且不动</b>，本设计只在数据采集与真值清洗两个侧面拓宽。</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="snum">01</p>
+    <h2>背景与两个关键修正</h2>
+    <p>评估 TF-GRPO 设计完备性时（详见记忆 <code>tfgrpo-design-completeness-assessment</code>），识别出三个"设计盲区"：冷启动、坏真值、运行编排。深入代码后，<strong>两个判断需要修正</strong>——这直接决定了下文的设计重点。</p>
+
+    <div class="principle warn"><span class="k">修正一 · 运行编排其实已全接通（先前误判为盲区）</span>
+    <code>.github/workflows/learn.yml</code> 每周一 02:00 UTC cron → 跑 <code>calibrate</code> → 跑 <code>learning_loop.main()</code>（L72-201，<strong>main 里确调 <code>graduate</code> L170 与 <code>retire</code> L178</strong>）→ 经验库若有变化则 commit 回 main。评审与学习<b>解耦</b>（评审走 PR 事件、只读经验库；学习是离线 cron）、持久化（<code>atomic_write_json</code> + 条件 git commit）、真值重建（<code>build_ground_truth</code>）全部到位。→ <b>盲区 3 降级</b>为"缺收敛/成本控制（§3.6 第 3-4 类施工）"，<b>不是</b>编排缺失。</div>
+
+    <div class="principle warn"><span class="k">修正二 · 冷启动死锁确认真实，且比 audit D2 更深一层</span>
+    <code>render_injection</code>（<code>experience_store.py:204</code>）只注入 <code>status=="active"</code>；candidate 从未被注入 → 历史 PR 的 <code>injected_types</code> 不含 candidate 的 type → <code>aggregate_ab</code>（<code>ground_truth.py:74</code>）对该 type 的 with 臂恒为 0 → <code>graduate</code>（<code>experience_store.py:138</code>，<code>ws&lt;20</code>）永远跳过。<strong>接通数据管线（audit D2 已修）≠ 打破死锁</strong>——TF-GRPO 蒸出的 candidate 永远卡在池里，唯一进注入的是人手写 <code>seed_experience</code>（直接 active+locked，<code>experience_store.py:88</code>），<b>那不算"自进化"</b>。</div>
+
+    <p>因此本设计的重心是<strong>盲区 1（冷启动死锁破局）</strong>，给出详案；盲区 2 给中案；盲区 3 给降级说明。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="snum">02</p>
+    <h2>盲区 1 · 冷启动死锁破局（详案）</h2>
+
+    <h3>2.1 死锁机制（已逐行核实）</h3>
+    <ul>
+      <li><code>render_injection</code>（<code>experience_store.py:200-210</code>）只取 <code>status=="active"</code>，经 <code>_resolve_conflicts</code>（I3）后渲染成 PR-Agent 的 <code>extra_instructions</code>。</li>
+      <li><code>graduate</code>（<code>experience_store.py:125-146</code>）：candidate→active 需 A/B 两臂各 ≥ <code>GRADUATE_MIN_SAMPLES=20</code>（L23）且 <code>lift = (wa/ws) − (oa/os) ≥ 0.10</code>（L24）。</li>
+      <li><code>aggregate_ab</code>（<code>ground_truth.py:59-82</code>）：with 臂 = 该 finding_type 在历史 PR 的 <code>injected_types</code> 里出现过（即评审时是 active 被注入过）；without 臂 = 没注入过。</li>
+      <li><code>injected_types</code> 由评审时 orchestrator 经 <code>active_types(store)</code> 写进 <code>&lt;!-- touchstone-result: --&gt;</code> marker。</li>
+    </ul>
+    <div class="principle warn"><span class="k">因果链</span>candidate 从未 active → 任何历史 PR 的 <code>injected_types</code> 都不含 candidate 的 type → <code>aggregate_ab</code> 对 candidate type 的 <code>with_seen</code> 恒 0 → <code>graduate</code> 恒跳过。<code>ground_truth.py:64-65</code> 的注释自己也承认这一冻结态："冷启动期 with 臂为 0……需先靠 seed 注入积累。"——但 seed 是人写的（<code>source="human"</code>），不是自进化。</div>
+
+    <h3>2.2 破局方案评估</h3>
+    <table class="tbl">
+      <tr><th>方案</th><th>能破死锁?</th><th>安全性</th><th>改动量</th><th>冷启动速度</th></tr>
+      <tr>
+        <td class="mono"><strong>(a) Shadow 注入 candidate</strong><br>candidate 也按比例注入到一部分 PR（产 with 臂数据），但 review 输出隔离标灰；graduate 仍按 A/B 判</td>
+        <td class="ok">✅ 真破<br>with 臂真实增长，graduate 判定不变</td>
+        <td class="mid">中<br>采数期影响评审，需隔离+灰度</td>
+        <td>中-大</td>
+        <td>~4-5 周期<br>(120-150 PR)</td>
+      </tr>
+      <tr>
+        <td class="mono">(b) Bootstrap 提权<br>高置信 candidate（source_prs≥K、组内 reward 一致高）直接 active，跳过 A/B</td>
+        <td class="no">绕过非破</td>
+        <td class="no">低-中<br>无 lift 证据；误激活存活至 retire≥8 fires</td>
+        <td>小</td>
+        <td>1 周期</td>
+      </tr>
+      <tr>
+        <td class="mono">(c) 自动 seed<br>从 calibrate 高采纳率 type 自动产一条 active 经验，替同 type 的 candidate 撑 with 臂</td>
+        <td class="mid">辅助</td>
+        <td class="ok">低<br>证据来自 calibrate 高采纳</td>
+        <td>中</td>
+        <td>seed 立即；candidate 仍 4-5 周期</td>
+      </tr>
+    </table>
+
+    <h3>2.3 推荐：(a) + (c) 组合，否决 (b)</h3>
+    <div class="principle warn"><span class="k">否决 (b) 的根本理由</span>"无 A/B 证据即激活"在<b>数据层放宽了门控断言</b>——违反 <code>experience_store.py:124</code> 的设计纪律（"candidate 先入池、经 shadow A/B 达标才转 active"，即坑 3）。<code>retire</code> 兜底是"事后纠错"，但 <code>RETIRE_MIN_FIRES=8</code> 意味着坏经验至少误导 8 个 PR 才退役，advisory-only 红线下风险敞口不可接受；且 counting 蒸出的 candidate 根本没有 <code>group_rewards</code>，适用面窄。</div>
+    <div class="principle good"><span class="k">为什么是 (a)</span>(a) 是<b>唯一真正"破"死锁</b>的方案：让 candidate 的 with 臂从 0 真实增长到 ≥20，<code>graduate</code> 的 lift 判定全流程不变，A/B 门控纪律完全保留——它只在"数据采集"侧拓宽一个口子（candidate 也参与采数），<b>不改"激活判定"侧的任何阈值</b>。</div>
+    <div class="principle"><span class="k">为什么加 (c) 作辅助</span>纯冷启动（经验库空、calib_agg 稀疏）时，shadow 注入要"该 type 在 <code>raised_types</code> 里出现"才有意义，若该 type 极少被挑，with 臂积累极慢。(c) 的 bootstrap seed 让该 type 至少有一条 active 经验、立即进 <code>active_types</code>，使后续同 type candidate 的 with/without 对照有稳定基准、评审质量先受益。但 (c) <b>不能替代 (a)</b>——它只把"第一个 active"从人手变自动，candidate 自己仍走正常 graduate。</div>
+
+    <h3>2.4 实现路径（函数签名级，A-lane 范围）</h3>
+
+    <p><strong>Experience 结构</strong>（<b>不改现有字段语义，仅扩</b>，契约安全）：</p>
+    <ul>
+      <li><code>status</code> 枚举 <code>candidate | active | retired</code> → 加 <code>shadow</code>（语义="采 A/B 数据、隔离标灰注入、未达门槛"）。现有三值语义不变 → <b>现有测试不受影响</b>。</li>
+      <li><code>evidence</code> 加 <code>shadow_fires</code>（采数 PR 数）、<code>graduated_via</code>（<code>"ab" | "bootstrap"</code>）——向后兼容，缺失即默认。</li>
+      <li><code>source</code> 加 <code>bootstrap</code>（仅 (c) 用）；<code>seed_experience</code> 的 <code>source="human"</code> 不变（契约：seed 是人写的）。</li>
+    </ul>
+
+    <p><strong>配置开关</strong>（env，<b>默认全关 = 字节级零行为变化</b>，这是回退保险）：</p>
+    <table class="tbl">
+      <tr><th>env</th><th>默认</th><th>作用</th></tr>
+      <tr><td class="mono">TOUCHSTONE_SHADOW_INJECTION</td><td>关</td><td>开 → candidate 可进 shadow 注入</td></tr>
+      <tr><td class="mono">TOUCHSTONE_SHADOW_RATIO</td><td>0.5</td><td>每轮按比例选入 shadow（限制单轮爆炸面）</td></tr>
+      <tr><td class="mono">TOUCHSTONE_SHADOW_MAX_PER_REVIEW</td><td>3</td><td>单次评审最多注入 N 条 shadow（防 prompt 膨胀）</td></tr>
+      <tr><td class="mono">TOUCHSTONE_SHADOW_MIN_EVIDENCE</td><td>1</td><td>candidate 至少 N 个 source_prs 才入选（质量门槛）</td></tr>
+      <tr><td class="mono">TOUCHSTONE_BOOTSTRAP_SEED</td><td>关</td><td>开 → calibrate 高采纳 type 自动产 active 经验</td></tr>
+      <tr><td class="mono">TOUCHSTONE_BOOTSTRAP_MIN_FIRES</td><td>15</td><td>高于 DISTILL_MIN_FIRES=8，更保守</td></tr>
+      <tr><td class="mono">TOUCHSTONE_BOOTSTRAP_MIN_ADOPT</td><td>0.85</td><td>高于 EMPHASIZE_ADOPT_MIN=0.80</td></tr>
+    </table>
+
+    <p><strong>函数改动</strong>：</p>
+    <table class="tbl">
+      <tr><th>文件</th><th>改动</th></tr>
+      <tr><td class="mono">experience_store.py</td>
+        <td>新增 <code>shadow_candidates(store, *, ratio, max_per_review, min_evidence) -&gt; list</code>——<b>确定性哈希抽样</b>（<code>hashlib</code> 稳定哈希，防 PYTHONHASHSEED 抖动污染归因），过滤 <code>protected_types</code> 的 suppress（安全闸）。<br>
+        改 <code>render_injection(store, *, include_shadow=False)</code>——<b>默认 False 行为不变</b>（只 active）；True 时 active 段后追加 <code># Shadow candidates (exploratory, advisory only)</code> 段、每条前缀 <code>[shadow]</code>。<br>
+        新增 <code>shadow_types / shadow_ids</code>（镜像 <code>active_*</code>，给 marker 归因）。<br>
+        <b><code>graduate</code> 零改动</b>——核心优雅点：激活判定侧不动。</td></tr>
+      <tr><td class="mono">ground_truth.py</td>
+        <td><code>aggregate_ab</code> 的 with 臂判据 <code>ftype in injected</code> → <code>ftype in (injected | shadow_injected)</code>；without 臂不变。<code>make_gt_entry(..., shadow_types=None)</code> 加可选参数（默认空，向后兼容）；<code>build_ground_truth</code> 从 marker 读 <code>shadow_types</code> 传入。</td></tr>
+      <tr><td class="mono">orchestrator.py</td>
+        <td>marker 归因（L498-505 + L275-285）：env 开时采 shadow 集，marker 加 <code>shadow_types</code> / <code>shadow_experience_ids</code> 两字段。</td></tr>
+      <tr><td class="mono">review_provider.py</td>
+        <td>注入文本生成（<code>_experience_injection</code>）：env 开时透传 <code>include_shadow=True</code>；<b>投毒防御 <code>TOUCHSTONE_EXPERIENCE_REF</code> 必须同等作用于 shadow</b>（candidate 也走受信 ref）。</td></tr>
+      <tr><td class="mono">distill.py</td>
+        <td>新增 <code>bootstrap_from_calibrate(calib_agg, store, repo, stack) -&gt; list</code>——<b>只产 emphasize</b>（高采纳=该挑）、<code>locked=False</code>（让 retire 能管，与人手 seed 的 locked=True 区分）、跳过 protected_types、该 type 尚无 active 才产（不重复）。<b>不产 suppress</b>（风险更高，留人手）。</td></tr>
+      <tr><td class="mono">learning_loop.py</td>
+        <td><code>graduate</code> 调用点（L170）不变；若启用 (c)，在 <code>merge_candidates</code>（L157）后、<code>aggregate_ab</code>（L167）前插 bootstrap seed 生成。</td></tr>
+    </table>
+
+    <blockquote class="note"><b>契约审查（marker 加字段）</b>：result marker 是 A-lane 内部产物（orchestrator 写、calibrate 解析），<b>不是</b> §3 铁律 1 冻结的层间契约（<code>Finding</code>/<code>RiskAssessment</code>/<code>SubmissionContract</code>/<code>CalibrationRecord</code>/总闸）。加 <code>shadow_types</code> 不违反铁律 1；但实施前需确认 <code>calibrate._parse_result</code> 对未知字段容错（json 取已知键忽略未知，已核实为现有模式）。</blockquote>
+
+    <h3>2.5 风险与缓解</h3>
+    <div class="principle warn"><span class="k">采数期影响（最大风险）</span>candidate 在 shadow 期进入 <code>extra_instructions</code>，<b>会真实影响 PR-Agent 的建议</b>。若 candidate 是错的：suppress 类误注入会降召回（缓解：<code>SHADOW_MIN_EVIDENCE</code> 初筛 + protected_types 强约束 + 文本标灰）；emphasize 类误注入会增噪声（缓解：candidate 文本来自旗舰模型内省、非用户输入，投毒面小）。<b>advisory-only 保证不进 contract_check / verify / 总闸</b>——坏经验最坏让一条建议偏一点，人忽略即可。</div>
+    <div class="principle warn"><span class="k">确定性抽样（必须）</span>必须用稳定哈希（<code>hashlib</code>，<b>非</b> <code>hash()</code>），否则同 store 在不同评审进程选不同 shadow 集 → 归因混乱。</div>
+    <div class="principle good"><span class="k">时序安全（已核实）</span>marker 是评审时快照，<code>build_ground_truth</code> 读历史 marker，与 candidate 当前 status 无关——candidate 在 PR#N 评审时是 shadow、之后才转 active，归因仍正确落到"曾 shadow 注入"。</div>
+    <div class="principle warn"><span class="k">bootstrap 过拟合</span>冷启动期 calib_agg 样本少，某 type 偶然全采纳可能触发 bootstrap。缓解：<code>MIN_FIRES=15</code>（高于入池门槛 8）抑制偶然高采纳。</div>
+
+    <h3>2.6 冷启动预估（基于 min_samples=20 / GT_WINDOW=30）</h3>
+    <ul>
+      <li><strong>纯 (a)</strong>：某 type 每 30-PR 窗口 raised ~10 次、shadow 比例 0.5 → 每周期 ~5 个 with 臂样本 → <b>首个 candidate active 约 4-5 周期（120-150 PR 流量）</b>。</li>
+      <li><strong>(a) + (c)</strong>：bootstrap seed 立即产 1 条 active emphasize → 该 type 立即进 <code>active_types</code> → <b>评审质量先受益</b>；candidate 自己 active 仍 4-5 周期。</li>
+    </ul>
+    <p class="muted">说明：4-5 周期是以"默认 G=4、GT_WINDOW=30、shadow_ratio=0.5"估算。可调 <code>TOUCHSTONE_SHADOW_RATIO=1.0</code>（牺牲安全裕度换速度）压缩到 2-3 周期。</p>
+
+    <h3>2.7 可独立合入的 6 步（每步默认关 env、现有测试全绿、可回退）</h3>
+    <ol>
+      <li><code>status=shadow</code> + evidence 字段 + <code>shadow_candidates</code> + <code>render_injection(include_shadow=False)</code>（默认关）。</li>
+      <li><code>aggregate_ab</code> 拓宽 with 臂 + <code>make_gt_entry</code> 加参数（向后兼容）。</li>
+      <li>orchestrator marker 加 shadow 字段（先确认 <code>_parse_result</code> 容错）。</li>
+      <li>review_provider <code>include_shadow</code> 透传 + 受信 ref 同等约束。</li>
+      <li><b>验收测试 <code>test_cold_start_candidate_graduates_via_shadow</code></b>（先红后绿——破死锁的可证伪锚点）。</li>
+      <li>（可选）<code>bootstrap_from_calibrate</code> + main 调用点。</li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="snum">03</p>
+    <h2>盲区 2 · 坏真值检测（中案，冷启动之后）</h2>
+
+    <h3>3.1 现状（已较完善）</h3>
+    <p>采纳判定（<code>calibrate.py</code> + <code>ground_truth.py</code>）已覆盖：<code>isResolved</code> + wontfix 关键词过滤（<code>_DISMISS</code> L78-87）+ 作者自 resolve 排除（L98）+ 非 trusted-author marker 跳过（L101）。硬过滤 2 条（无 marker / 取数失败），软降权 3 条。</p>
+
+    <h3>3.2 真实留白与设计</h3>
+    <div class="principle"><span class="k">留白 1 · reviewer 分级加权</span>现有 GraphQL（<code>calibrate.py:45-54</code> <code>_GQL_THREADS</code>）不查 <code>author_association</code>。<b>设计</b>：扩查询拿 <code>comments.author.association</code>（OWNER / MEMBER / COLLABORATOR / CONTRIBUTOR），低权重 reviewer 的采纳信号<b>软降权</b>（不剔除）。</div>
+    <div class="principle"><span class="k">留白 2 · LGTM-only 识别</span>现在只取 review <code>state</code>，不看 body / 评论数。<b>设计</b>：识别 review body 简短（&lt;N 字）或仅含 LGTM/Approved 关键词的"一键过" PR，<b>软降权</b>。</div>
+    <div class="principle"><span class="k">留白 3 · 坏真值检测机制（§3.6 第 5 类给的是循环引用，须给可观测信号）</span>
+    <b>信号 A</b>：某 PR 进真值集后蒸馏时全组 reward 系统性低（<code>human_adopted</code> 与 raised 几乎不重叠）→ 真值可疑。数据基础：<code>evidence.group_rewards</code> + <code>source_prs</code>（部分有）；<b>缺 PR-reward 历史序列，设计需补持久化</b>。<br>
+    <b>信号 B</b>：LGTM-only（见留白 2）。<br>
+    <b>信号 C</b>：低权重 reviewer（见留白 1）。<br>
+    <b>信号 D</b>：改动行数极少却 resolved（<code>GT_DIFF_BUDGET</code> 已取 diff，可复用统计）。<br>
+    <b>处理策略</b>：默认<b>软降权</b>（进真值集但 weight 低），仅多信号叠加且 reward 离群时<b>硬剔除</b>。</div>
+
+    <div class="principle good"><span class="k">定位</span>盲区 2 是奖励质量（§3.6 第 1 类）的<b>前置</b>——坏真值直接污染 reward → 蒸馏出低质量经验。建议<b>冷启动之后、奖励质量之前</b>做：冷启动让闭环转起来，坏真值清洗让转起来的信号更干净。</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="snum">04</p>
+    <h2>盲区 3 · 运行编排（降级说明）</h2>
+    <div class="principle good"><span class="k">修正</span>编排已全接通（learn.yml cron / calibrate→main→commit / 解耦 / 持久化 / 真值重建）。先前"运行编排空白"判断<b>不成立</b>。</div>
+    <p>真正缺的（归入 §3.6 第 3-4 类施工化，<b>非独立盲区</b>）：</p>
+    <table class="tbl">
+      <tr><th>§3.6 类</th><th>当前状态</th><th>生产需要</th></tr>
+      <tr><td class="mono"><strong>第 3 类 · 收敛诊断</strong></td>
+        <td>每轮全量重跑、无收敛检测；无效果指标（注入前后采纳率变化）</td>
+        <td>某 type 经验已稳定则停蒸馏 + 增量；differential metrics + 回滚机制</td></tr>
+      <tr><td class="mono"><strong>第 4 类 · 规模成本</strong></td>
+        <td>无预算上限（默认 G×PR×2 = 240 调用/轮无 cap）、无缓存、rollout 串行（<code>distill.py:125</code>）</td>
+        <td>预算管控 + 增量蒸馏（只处理新 PR）+ 缓存 + 批优化</td></tr>
+    </table>
+    <p>列为后续（与 §3.6 第 3-4 类合并推进），<b>本次不展开施工设计</b>。优先级低于冷启动（死锁）与坏真值（信号质量）——后两者不解决，收敛/成本优化是在"可能学偏"的基础上省算力，价值有限。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="snum">05</p>
+    <h2>落地策略与 lane / 联审边界</h2>
+    <div class="principle"><span class="k">本次产出</span>本设计文档（A-lane 设计产物），覆盖盲区 1（详）/ 2（中）/ 3（降级说明），回答"自进化闭环怎么安全转起来"。<b>不写代码</b>。</div>
+    <div class="principle good"><span class="k">落地位置</span>本文档为新建独立文件 <code>docs/tfgrpo-self-evolution-design.html</code>（与 <code>learning-loop-design.html</code> 同套样式）——<b>不动现有 §3 数据结构</b>、A-lane 自洽、联审风险最低。</div>
+    <div class="principle warn"><span class="k">lane 边界（代码实施时）</span>盲区 1 的改动全在 A-lane（<code>experience_store / ground_truth / orchestrator / review_provider / distill / learning_loop</code>）。<b>待核实</b>：若 marker 加 <code>shadow_types</code> 触发 <code>tests/test_e2e_smoke.py</code> 的 strict schema 校验 → e2e 是共有文件，<b>走联审</b>（CLAUDE.md 铁律 3）。</div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="snum">06</p>
+    <h2>验证与待核实点</h2>
+    <div class="principle"><span class="k">设计文档自身</span>对照 §3.6 五类差距清单核覆盖率：冷启动破死锁 + 坏真值检测信号 = <b>第 1/5 类施工化</b>；编排降级 = <b>第 3/4 类待续</b>；第 2 类（蒸馏质量）未在本设计范围（依赖奖励质量先就位）。</div>
+    <div class="principle good"><span class="k">可证伪锚点</span>冷启动方案的设计验收 = 测试 <code>test_cold_start_candidate_graduates_via_shadow</code>：<b>现状死锁下应红</b>（candidate 永不 active）、<b>方案生效后应绿</b>。它既是代码实施的验收定义，也是本设计"真的破死锁"的可证伪证据。</div>
+    <div class="principle warn"><span class="k">待核实点（代码实施时，不阻塞设计定稿）</span>
+    ① 注入侧 orchestrator（marker 归因）vs review_provider（注入文本生成）的具体函数边界——设计层面两处接缝均已覆盖。<br>
+    ② <code>calibrate._parse_result</code> 对未知 marker 字段容错（加 <code>shadow_types</code> 前置确认）。<br>
+    ③ <code>tests/test_e2e_smoke.py</code> 是否 strict 校验 marker schema（若是 → 联审）。</div>
+    <p class="muted">本次不跑代码测试（只写设计）；代码实施时跑 <code>tests/test_learning_loop.py</code> + e2e + ruff/mypy。</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">Touchstone · TF-GRPO 自进化闭环设计 · 2026-07-20 · 自包含离线文档（与 <code>learning-loop-design.html</code> 同一套样式）</div>
+</footer>
+
+</body>
+</html>

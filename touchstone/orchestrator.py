@@ -14,6 +14,7 @@
 
 import json
 import os
+import time
 import re
 import sys
 
@@ -31,6 +32,7 @@ from touchstone import stack_rules           # §4.1 栈专项确定性规则（
 from touchstone import checklist as checklist_mod   # 收敛清单（修订设计 §4.3，评审意见 1、3）
 from touchstone import lineage               # 轮次台账与同源检测（修订设计 §4.4，评审意见 10）
 from touchstone.atomicio import atomic_write_json   # 状态文件原子写（决策输入不留半文件）
+from touchstone.artifacts import artifact_path      # 统一产物路径（默认 CWD，可经 OUTPUT_DIR 隔离）
 # 渲染层已拆至 touchstone/render.py（七段版面填充；模块职责单一化）。此处再导出以保持
 # 既有引用路径 orchestrator.render_* 兼容（测试与外部调用无需改动）。
 from touchstone.render import (_load_template, render_facts, render_findings,  # noqa: F401
@@ -210,6 +212,7 @@ def _render_engine_detail(engine_status, engine_detail):
 
 def post_results(owner, repo, number, head_sha, token, risk, findings, loop_info=None,
                  change_class=None, diff=None, injected_types=None, injected_experience_ids=None,
+                 shadow_types=None, shadow_experience_ids=None,
                  engine_status="ok", det_warning="", ai_raw_count=0, added_lines=0, n_changed=0,
                  scope_facts=None, checklist_md="", ledger=None, review_reliable=True,
                  llm_notes=None, raw_excerpt=None, unverified_claims=0, telemetry_status="disabled",
@@ -279,6 +282,8 @@ def post_results(owner, repo, number, head_sha, token, risk, findings, loop_info
         "loop_decision": (loop_info[0] if loop_info else None),
         "injected_types": injected_types,          # 本轮注入的经验类型（供 shadow A/B 分臂采集）
         "injected_experience_ids": injected_experience_ids,   # 本轮注入的经验【id】（单条归因/回退，见数据采集设计 取舍2）
+        "shadow_types": shadow_types or [],              # 本轮 shadow 注入的 candidate 类型（破冷启动死锁，with 臂归因；SHADOW_INJECTION 开时非空；None→[] 稳定 list 类型）
+        "shadow_experience_ids": shadow_experience_ids or [],   # 本轮 shadow 注入的 candidate【id】（单条归因/回退；None→[]）
         "findings": [{"rule_id": f.get("rule_id"), "agent": f.get("agent"),
                       "severity": f.get("severity")} for f in findings],
         "unverified_claims": unverified_claims,
@@ -322,6 +327,45 @@ def post_results(owner, repo, number, head_sha, token, risk, findings, loop_info
 
 
 # --- main ---------------------------------------------------------------------
+def _collect_injection():
+    """取本轮要写入 result marker 的经验注入类型：active（生产路径）+ shadow（实验路径，env 开时）。
+    与 review_provider._experience_injection 同源（只读经验库、失败即空）。
+    active 是生产路径、shadow 是实验路径——shadow 取值用【独立内层】try/except 隔离：shadow 抛异常
+    只丢弃 shadow、不 wipe 已成功取到的 active（pr-agent review #117 指出的失败隔离点）。四者皆
+    失败即空（marker 写空）。shadow 仅 TOUCHSTONE_SHADOW_INJECTION 开时才取（默认关=字节级不变，
+    需 step4 review_provider include_shadow 透传后才不归因失真——见 _shadow_injection_enabled）。"""
+    injected_types, injected_experience_ids = [], []
+    shadow_types, shadow_experience_ids = [], []
+    try:
+        from touchstone import learning_loop as _ll
+        _store = _ll.load_store()
+        injected_types = _ll.active_types(_store)
+        injected_experience_ids = _ll.active_ids(_store)
+        if _ll._shadow_injection_enabled():
+            try:
+                shadow_types = _ll.shadow_types(_store)
+                shadow_experience_ids = _ll.shadow_ids(_store)
+            except Exception:
+                shadow_types, shadow_experience_ids = [], []
+    except Exception:
+        injected_types, injected_experience_ids = [], []
+    return injected_types, injected_experience_ids, shadow_types, shadow_experience_ids
+
+
+def _max_diff_lines():
+    """SIZE-001 体量门禁阈值。空串（vars 未创建时 `${{ vars.X }}` 透传的常态）回落默认 1000，
+    只有显式 "0" 才关闭——上游报告问题三：此前空串经 `or 0` 静默关闭门禁，超大 PR 直送 LLM 且无提示。"""
+    raw = (os.environ.get("TOUCHSTONE_MAX_DIFF_LINES") or "").strip()
+    if not raw:
+        return 1000
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[warn] TOUCHSTONE_MAX_DIFF_LINES={raw!r} 非数字，回落默认 1000（SIZE-001 门禁保持生效）",
+              file=sys.stderr)
+        return 1000
+
+
 def review_pr(pr, contract, standards, provider=None):
     """§4.1 主入口：复用 PR-Agent 评审 → 发现归一 → 提交契约核对 + 栈专项确定性规则 → 裁决映射。
     等价于 map_verdict( normalize(fetch(pr)) + check_contract_consistency(...) + check_stack_rules(...) )。
@@ -338,7 +382,7 @@ def review_pr(pr, contract, standards, provider=None):
     raw_excerpt = {}        # LLM 原始 review 段快照（0 原始建议时贴横幅，打消"是否真审过"疑虑）
     llm_notes = []          # LLM 侧非致命注记（部分降级/截断修复），进报告横幅
     engine_detail = ""      # 降级/失败时的具体原始错误（PR#68 做准的 reason）——留给渲染层
-    max_lines = int(os.environ.get("TOUCHSTONE_MAX_DIFF_LINES", "1000") or 0)
+    max_lines = _max_diff_lines()
     size_findings = []
     if max_lines > 0 and added_lines > max_lines:
         engine_status = "skipped_large_diff"
@@ -402,6 +446,7 @@ def review_pr(pr, contract, standards, provider=None):
 
 
 def main():
+    _t_main0 = time.monotonic()
     token = os.environ["GITHUB_TOKEN"]
 
     event = load_yaml(os.environ["GITHUB_EVENT_PATH"]) or {}
@@ -422,9 +467,34 @@ def main():
     changed_files, _ = contract_check.parse_diff(diff)
 
     # 评审主链（§4.1）：PR-Agent 评审归一 + 契约核对 + 栈专项确定性规则 → 裁决映射
+    # 守卫核销预取（issue #139 方案 C）：上轮权威清单的 open 项守卫事实须在评审【前】
+    # 注入，故此处轻量早取一次评论解析 marker（与下方反馈循环的正式取用相互独立；
+    # 双取代价一次 GET，换取不重排 main 流程）。失败即空——绝不阻塞评审链路。
+    guard_adjudication = ""
+    try:
+        # import 同在 try 内（PR#140 R3 意见 3）：模块导入失败也走"失败即空"降级，
+        # 不允许守卫增强层的 ImportError 崩掉 main()——与 attach 面的包裹口径一致。
+        from touchstone import guard_context as _gc0
+        if _gc0.enabled():
+            _pre_comments = gh("GET", f"/repos/{owner}/{repo}/issues/{number}/comments", token)
+            _pre_bodies = loop.trusted_bodies(
+                _pre_comments if isinstance(_pre_comments, list) else [], None)
+            _pre_cl = checklist_mod.parse_latest(_pre_bodies)
+            if _pre_cl:
+                guard_adjudication = _gc0.render_adjudication(
+                    _pre_cl.get("items", []), os.environ.get("REPO_DIR", "."))
+    except Exception:
+        guard_adjudication = ""
+    # repo_dir 显式透传（PR#140 R2 意见 1）：guard_adjudication 用 REPO_DIR 解析，而
+    # review_provider 侧 digest 此前回退 pr_ctx.get("repo_dir",".")——REPO_DIR 非默认时
+    # 两个守卫面解析目录不一致，digest 静默扫错目录返回空。单一来源，两面同目录。
     pr_ctx_review = {"owner": owner, "repo": repo, "number": number, "sha": head_sha,
-                     "token": token, "diff": diff, "standards": standards}
+                     "token": token, "diff": diff, "standards": standards,
+                     "repo_dir": os.environ.get("REPO_DIR", "."),
+                     "guard_adjudication": guard_adjudication}
+    _t_rev0 = time.monotonic()
     _out = review_pr(pr_ctx_review, contract, standards)
+    _t_review = round(time.monotonic() - _t_rev0, 2)
     findings, risk = _out["findings"], _out["risk"]
     engine_status = _out.get("engine_status", "ok")
     det_warning = _out.get("det_warning", "")
@@ -476,6 +546,11 @@ def main():
     acks = checklist_mod.parse_acks(all_bodies)
     cur_cl = checklist_mod.reconcile(prev_cl, acks, findings, round_no=state.round + 1,
                                      review_reliable=reliable)
+    try:                                       # 守卫事实附着（issue #139 方案 C）：只附着不判断，
+        from touchstone import guard_context as _gc2   # 供人 waived 佐证 + 下一轮核销注入复用
+        _gc2.attach_guard_facts(cur_cl, os.environ.get("REPO_DIR", "."))
+    except Exception:
+        pass    # 静默豁免：守卫附着是纯增强，失败即无守卫行；抛出会阻塞收敛清单主链
     checklist_mod.snapshot(cur_cl)          # 本轮快照写入文件（供可视化与校准回放）
     n_unverified = len(checklist_mod.unverified_claims(cur_cl))   # author 自证未核准销项数
 
@@ -493,16 +568,9 @@ def main():
     cls = autonomy.change_class(risk, findings, sorted(changed_files), rule_index)
     contract_clean = not any(f.get("agent") == "contract-check" for f in findings)
 
-    # 本轮注入的经验类型（学习回路 active 经验）——写入 result marker，供未来 shadow A/B 分臂采集。
-    # 与 review_provider._experience_injection 同源（只读经验库、失败即空）。
-    injected_types, injected_experience_ids = [], []
-    try:
-        from touchstone import learning_loop as _ll
-        _store = _ll.load_store()
-        injected_types = _ll.active_types(_store)
-        injected_experience_ids = _ll.active_ids(_store)
-    except Exception:
-        injected_types, injected_experience_ids = [], []
+    # 本轮注入的经验类型（active 生产 + shadow 实验）由 _collect_injection 统一取：shadow 取值独立
+    # try 隔离，失败不 wipe active（pr-agent review #117 隔离点）。详见 _collect_injection。
+    injected_types, injected_experience_ids, shadow_types, shadow_experience_ids = _collect_injection()
 
     rd_path = os.environ.get("TOUCHSTONE_RDJSON_PATH")
     if rd_path:                       # 可选 reviewdog 后端：导出 RDFormat，行内投递交 reviewdog
@@ -558,7 +626,9 @@ def main():
             engine_status=engine_status, review_reliable=reliable,
             ai_raw_count=ai_raw_count, loop_decision=decision, gate=gate,
             unverified_claims=n_unverified, change_class=cls,
-            added_lines=added_lines, round_no=new_state.round, invoke_meta=_meta)
+            added_lines=added_lines, round_no=new_state.round, invoke_meta=_meta,
+            durations={"t_review": _t_review,
+                       "t_total": round(time.monotonic() - _t_main0, 2)})
         _metrics.emit(_rec)
         # 告警钩子（可观测性投递）：按 env 选通道，判定并投递到客户自己配置的渠道。
         # 总开关不开 → 无操作（只保留上面的 metrics artifact）。失败绝不冒泡——不拖垮评审 job；
@@ -614,6 +684,7 @@ def main():
 
     post_results(owner, repo, number, head_sha, token, risk, findings, loop_info, cls, diff,
                  injected_types=injected_types, injected_experience_ids=injected_experience_ids,
+                 shadow_types=shadow_types, shadow_experience_ids=shadow_experience_ids,
                  engine_status=engine_status, det_warning=det_warning,
                  ai_raw_count=ai_raw_count, added_lines=added_lines, n_changed=n_changed,
                  scope_facts=scope_facts, checklist_md=checklist_md, ledger=ledger,
@@ -655,7 +726,7 @@ def main():
                      # 情形（.get("user", {}) 只挡缺失、挡不住 "user": null 的 None.get() 崩溃）。
                      "author": {"login": (pr.get("user") or {}).get("login"),
                                 "association": pr.get("author_association")}}
-    atomic_write_json("touchstone-findings.json", _findings_doc)
+    atomic_write_json(artifact_path("touchstone-findings.json"), _findings_doc)
 
     # 风险分流的 job 输出：供下游 verify job 决定是否触发验证
     gho = os.environ.get("GITHUB_OUTPUT")

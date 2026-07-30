@@ -19,7 +19,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-GH_RETRY_MAX = int(os.environ.get("GH_RETRY_MAX", "5"))
+GH_RETRY_MAX = int((os.environ.get("GH_RETRY_MAX") or "").strip() or "5")
 
 
 def _base_url():

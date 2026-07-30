@@ -1,0 +1,66 @@
+# 预热 PR-Agent venv 缓存（上游报告问题一的正解半边）。
+#
+# 背景：GitHub 2026-06-26 起，pull_request_target 等低信任触发器对默认分支作用域的 Actions
+# 缓存【只读】——评审工作流里的 cache/save 永远失败（"token has no writable scopes"）。
+# 官方推荐：由可信触发器（push 到默认分支 / schedule / workflow_dispatch）预热缓存，
+# 低信任工作流只 restore。本工作流即预热侧；touchstone.yml 已改为 restore-only。
+#
+# 键与 touchstone.yml 的 restore 键必须逐字段一致（含 runner.arch——runner.os 对 x64/arm64
+# 同为 Linux，venv 带编译产物，跨架构命中不可用）。
+# 集成方注意：若把 touchstone checkout 到子目录，请同步调整两处 hashFiles 的路径。
+name: Warm PR-Agent venv cache
+on:
+  push:
+    branches: [main]
+    # 含 touchstone.yml：PRA_VERSION 在那边升版会改缓存键（键嵌 pragent${VERSION}）——
+    # 若不触发预热，新键要等到周调度才落盘，期间每个 PR 白重建 venv（~57s/轮）。
+    paths:
+      - pragent-constraints.txt
+      - .github/workflows/warm-pragent-cache.yml
+      - .github/workflows/touchstone.yml
+  schedule:
+    - cron: "17 3 * * 1"     # 每周一预热一次：兜底 runner 镜像更新导致的 Python 补丁号变化（键含补丁号）
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write             # 可信触发器下写缓存有效（与低信任触发器的只读限制相对）
+
+env:
+  PRA_VERSION: "0.39.0"      # 与 touchstone.yml 的 env.PRA_VERSION 保持一致（升版两处同改）
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: "3.13"   # 评审意见：两个工作流必须钉同一版本——缓存键含解析出的补丁号，
+                                   # 任一侧漂移即全员 cache miss；且 pragent-constraints 硬下限即 3.13
+      - name: Restore (skip rebuild on hit)
+        id: pv
+        uses: actions/cache/restore@v4
+        with:
+          path: .pragent-venv
+          key: pragent-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.py.outputs.python-version }}-pragent${{ env.PRA_VERSION }}-lock${{ hashFiles('pragent-constraints.txt') }}-v1
+      - name: Build venv (same guarded steps as touchstone.yml)
+        if: steps.pv.outputs.cache-hit != 'true'
+        run: |
+          rm -rf .pragent-venv
+          if python -m venv .pragent-venv \
+             && .pragent-venv/bin/pip install -U pip \
+             && .pragent-venv/bin/pip install pr-agent==${{ env.PRA_VERSION }} -c pragent-constraints.txt; then
+            echo "[warm] 安装成功"
+          else
+            echo "[warm] 安装失败——清理破损 venv，不写缓存"
+            rm -rf .pragent-venv
+            exit 1
+          fi
+      - name: Save cache
+        if: steps.pv.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .pragent-venv
+          key: pragent-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.py.outputs.python-version }}-pragent${{ env.PRA_VERSION }}-lock${{ hashFiles('pragent-constraints.txt') }}-v1

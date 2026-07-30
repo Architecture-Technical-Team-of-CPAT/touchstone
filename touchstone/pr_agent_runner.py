@@ -25,6 +25,7 @@
 # ============================================================================
 
 import argparse
+import time
 import asyncio
 import json
 import os
@@ -45,6 +46,12 @@ def _read(path):
         return f.read()
 
 
+def _ping_enabled():
+    """预检 ping 开关（上游报告问题五）：默认开（防静默故障的决定性观测点）；
+    端点已确认健康、fan-out 下想省 improve/review 各一次往返的部署可置 false 关闭。"""
+    return (os.environ.get("TOUCHSTONE_LLM_PING", "true") or "").strip().lower() not in ("0", "false", "no")
+
+
 def _ping_llm(base, key, model):
     """直接探测 LLM 端点（1-token 请求），确认 base/key/model 可用。失败抛异常（带真实错误）。
     抽成函数便于测试 monkeypatch（离线测试不真发请求）。"""
@@ -57,9 +64,19 @@ def _ping_llm(base, key, model):
 # 本次 run() 的交互轨迹（关键节点日志），main() 据此 + 返回结果写完整交互日志（artifact）。
 # 单进程单线程，模块级即可。
 _IX: list = []
+_IX_T0: list = []      # run() 起点（monotonic）；上游报告问题四：交互日志自带阶段耗时
+
+
+def _reset_trace():
+    """重置交互轨迹与计时起点。run() 与测试都用它——评审意见：重置逻辑集中一处，
+    测试不再直接改 _IX/_IX_T0 内部结构，run() 的重置演化时测试同步生效。"""
+    _IX.clear()
+    _IX_T0[:] = [time.monotonic()]
 
 
 def _ix(msg):
+    if _IX_T0:
+        msg = f"[+{time.monotonic() - _IX_T0[0]:7.2f}s] {msg}"
     _IX.append(msg)
 
 
@@ -228,6 +245,24 @@ def _install_llm_call_tuning(model_override):
             _ix(f"流式启用失败: {type(e).__name__}: {e}")
 
 
+def _patch_context_settings():
+    """扩窗旋钮（issue #139 方案 A）：env 可调、纯函数可测。默认值取「守卫多在
+    enclosing 函数头到命中行之间」的经验面：动态上下文上限 10→30、前置固定行 5→10、
+    后置 1→3。回调消融：把三个 env 设回上游默认即得对照组。"""
+    def _envi(name, default):
+        # #140 R7：clamp 到非负——负的上下文行数会让 pr-agent 扩窗/补丁行计数下溢
+        try:
+            return max(0, int((os.environ.get(name) or "").strip() or default))
+        except (ValueError, TypeError):
+            return max(0, default)
+    return {
+        "allow_dynamic_context": True,
+        "max_extra_lines_before_dynamic_context": _envi("TOUCHSTONE_DYNAMIC_CONTEXT_MAX", 30),
+        "patch_extra_lines_before": _envi("TOUCHSTONE_PATCH_EXTRA_BEFORE", 10),
+        "patch_extra_lines_after": _envi("TOUCHSTONE_PATCH_EXTRA_AFTER", 3),
+    }
+
+
 def run(pr_url, mode, extra_instructions=None):
     """调 PR-Agent（不发评论）→ 返回 dict 供 touchstone 解析。
 
@@ -248,7 +283,7 @@ def run(pr_url, mode, extra_instructions=None):
       _degraded="llm_failed"     —— PR 已取到、但 LLM 调用失败（端点/鉴权/超时/解析等）
     """
     # 先把 LLM_* 映射成 LiteLLM 认的 env（必须在 import/调用 pr-agent 前注入）
-    _IX.clear()
+    _reset_trace()
     _ix(f"pr_url={pr_url} mode={mode} extra_instructions={len(extra_instructions or '')} 字符")
     if os.environ.get("LLM_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
         os.environ["OPENAI_API_KEY"] = os.environ["LLM_API_KEY"]
@@ -331,7 +366,7 @@ def run(pr_url, mode, extra_instructions=None):
     # 经 TOUCHSTONE_LLM_CALL_TIMEOUT env 配置（秒），默认 600s（glm-5.2 实测 360-380s，留余量）。
     # 注意与 TOUCHSTONE_PRAGENT_TIMEOUT（整个子进程超时，需 > N次调用×ai_timeout）区分。
     try:
-        s.config.ai_timeout = int(os.environ.get("TOUCHSTONE_LLM_CALL_TIMEOUT", "600"))
+        s.config.ai_timeout = int((os.environ.get("TOUCHSTONE_LLM_CALL_TIMEOUT") or "").strip() or "600")
     except (ValueError, TypeError):
         s.config.ai_timeout = 600
     # 关 pr-agent 的工单合规分析（pr_reviewer.require_ticket_analysis_review，pr-agent
@@ -351,12 +386,30 @@ def run(pr_url, mode, extra_instructions=None):
     if extra_instructions:
         s.pr_code_suggestions.extra_instructions = extra_instructions
         s.pr_reviewer.extra_instructions = extra_instructions
+    # 扩窗（issue #139 方案 A）：守卫上下文缺失型误报的第一杠杆。上游默认
+    # allow_dynamic_context=true / max_extra_lines_before_dynamic_context=10 /
+    # patch_extra_lines_before=5 / after=1（0.39.0 configuration.toml:42-45）——
+    # 守卫距命中行超过 10 行即被截掉。此处调大旋钮（env 可回调做消融对比）。
+    for k, v in _patch_context_settings().items():
+        try:
+            setattr(s.config, k, v)
+        except Exception as e:                    # 键不存在（版本不符）要可见，防静默退化
+            _ix(f"扩窗配置 {k}={v} 设置失败：{type(e).__name__}: {e}")
     # 压一压 LiteLLM 的 stdout 噪音（"LiteLLM.Info / Give Feedback" 等 print），减少 stderr 干扰。
-    # 需排查"LLM 到底被调了没"时设 TOUCHSTONE_LITELLM_VERBOSE=true，litellm 会把请求打到 stderr。
+    # 需排查"LLM 到底被调了没"时设 TOUCHSTONE_LITELLM_VERBOSE=true。
+    # 上游报告问题二：litellm 1.84 的 set_verbose 在【import 时】求值（litellm/__init__.py:91），
+    # import 后再赋值是空操作且被废弃；LITELLM_LOG=DEBUG 亦无效（只设 handler level，logger 仍 NOTSET）。
+    # 唯一有效方式是显式调 _turn_on_debug()。注意：DEBUG 走 stderr，会把 failure_stderr_tail 的
+    # 600 字符窗口填满、把真实报错挤出——仅供临时诊断，确认后应关闭。
     try:
         import litellm
         litellm.suppress_debug_info = True
-        litellm.set_verbose = os.environ.get("TOUCHSTONE_LITELLM_VERBOSE", "").lower() in ("1", "true", "yes")
+        if os.environ.get("TOUCHSTONE_LITELLM_VERBOSE", "").lower() in ("1", "true", "yes"):
+            try:
+                litellm._turn_on_debug()
+                _ix("litellm DEBUG 已开启（_turn_on_debug；api_key 由 litellm SecretRedactionFilter 脱敏）")
+            except Exception as _e:
+                _log.warning("litellm._turn_on_debug 失败（诊断日志不可用）：%s: %s", type(_e).__name__, _e)
         # 【勘误 + 语义变更】此处曾设 litellm.num_retries = max(1, env)。实证推翻其注释的机制：
         # 该全局是【一次性】的——litellm 1.84 的异常包装器在首个失败消费后即重置为 None
         # （litellm/utils.py:1698），此后 openai client 回落默认 max_retries=2（3 次尝试/调用），
@@ -385,14 +438,18 @@ def run(pr_url, mode, extra_instructions=None):
                 "reason": (f"LLM 配置不全：需 LLM_BASE_URL/LLM_API_KEY/LLM_MODEL 都设"
                            f"（model={model_override!r}, base={'有' if _base else '无'}, "
                            f"key={'有' if _key else '无'}）")}
-    try:
-        _ping_llm(_base, _key, model_override)
-        _ix("LLM 预检 ping: 成功（端点可达、凭据有效）")
-        _log.info("LLM 预检 ping 成功（端点可达、凭据有效）")
-    except Exception as e:
-        _ix(f"LLM 预检 ping: 失败 → llm_failed ({type(e).__name__}: {e})")
-        return {"_degraded": "llm_failed",
-                "reason": f"LLM 端点探测失败（{type(e).__name__}: {e}）—— base={_base} model={model_override}"}
+    if not _ping_enabled():
+        _ix("LLM 预检 ping: 跳过（TOUCHSTONE_LLM_PING=false；端点已确认健康的部署可关，省一次关键路径往返）")
+        _log.info("LLM 预检 ping 跳过（TOUCHSTONE_LLM_PING=false）")
+    else:
+        try:
+            _ping_llm(_base, _key, model_override)
+            _ix("LLM 预检 ping: 成功（端点可达、凭据有效）")
+            _log.info("LLM 预检 ping 成功（端点可达、凭据有效）")
+        except Exception as e:
+            _ix(f"LLM 预检 ping: 失败 → llm_failed ({type(e).__name__}: {e})")
+            return {"_degraded": "llm_failed",
+                    "reason": f"LLM 端点探测失败（{type(e).__name__}: {e}）—— base={_base} model={model_override}"}
 
     out = {"code_suggestions": [], "review": {"key_issues_to_review": []}}
     tools = set(mode.split("+"))

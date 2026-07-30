@@ -30,6 +30,23 @@ def test_emit_and_load_roundtrip(tmp_path):
     assert len(recs) == 2
 
 
+def test_metrics_path_resolved_lazily_post_import(monkeypatch, tmp_path):
+    """metrics 路径须在 emit/load【调用时】解析——import 后再设 TOUCHSTONE_OUTPUT_DIR 须生效，
+    不能用模块级缓存。pr-agent review #122 r1：原 ``METRICS_PATH`` 模块级求值，import 后改 env
+    致缓存陈旧、metrics 写错位置；改调用时解析与 PR 其它模块对齐。锁死：import 完再设 OUTPUT_DIR，
+    emit（不传 path）落到新目录、load（不传 path）读得回。"""
+    out = tmp_path / "late-dir"                       # import 时还不存在、env 也未设
+    monkeypatch.delenv("TOUCHSTONE_OUTPUT_DIR", raising=False)
+    monkeypatch.delenv("TOUCHSTONE_METRICS_PATH", raising=False)
+    # M 已在模块顶 import（早于下面 setenv）——若用模块级缓存，此刻 _metrics_path() 应是 import 时的值
+    monkeypatch.setenv("TOUCHSTONE_OUTPUT_DIR", str(out))
+    assert M.emit(_rec()) is True                     # 调用时解析 → 落 import 后才设的 OUTPUT_DIR
+    written = out / "touchstone-metrics.json"
+    assert written.exists()
+    recs = M.load()                                   # load 同样调用时解析、读得回
+    assert len(recs) == 1 and recs[0]["pr"] == 42
+
+
 def test_emit_catches_serialization_error(tmp_path, capsys):
     """record 含不可 JSON 序列化对象时，emit 必须【吞成 False 不抛】——契约承诺
     '失败不阻塞主流程'。旧版只接 OSError，json.dumps 的 TypeError/ValueError 会穿出去

@@ -14,24 +14,37 @@
 # ============================================================================
 
 import json
-import os
 import sys
 import time
 
 from touchstone import __version__
+from touchstone.artifacts import artifact_path, ensure_output_dir
 
-METRICS_PATH = os.environ.get("TOUCHSTONE_METRICS_PATH", "touchstone-metrics.json")
+# metrics 文件名 + 显式覆盖 env（兼容既有部署 TOUCHSTONE_METRICS_PATH）。路径在 emit/load 内
+# 【调用时】解析（与 PR 其它模块一致）——避免 import 后改 TOUCHSTONE_OUTPUT_DIR 致模块级缓存陈旧。
+_METRICS_NAME = "touchstone-metrics.json"
+_METRICS_OVERRIDE_ENV = "TOUCHSTONE_METRICS_PATH"
+
+
+def _metrics_path():
+    """调用时解析 metrics 路径（TOUCHSTONE_METRICS_PATH 覆盖优先，否则 OUTPUT_DIR/name）。
+    pr-agent review #122 r1：原 ``METRICS_PATH`` 模块级求值，import 后改 OUTPUT_DIR 致缓存陈旧、
+    metrics 写错位置；改调用时解析与 PR 其它模块对齐。"""
+    return artifact_path(_METRICS_NAME, override_env=_METRICS_OVERRIDE_ENV)
 
 
 def build(pr, sha, risk, findings, *, engine_status, review_reliable,
           ai_raw_count, loop_decision, gate, unverified_claims,
-          change_class, added_lines, round_no=None, invoke_meta=None):
+          change_class, added_lines, round_no=None, invoke_meta=None, durations=None):
     """把一轮评审的关键健康信号压成一条扁平指标记录（可 JSON 序列化的纯 dict）。
     invoke_meta：review_provider.invoke_meta()（部分降级/截断修复计数），可选。"""
     meta = invoke_meta or {}
+    dur = {k: round(float(v), 2) for k, v in (durations or {}).items()
+           if k.startswith("t_")}          # 阶段耗时（上游报告问题四：无耗时数据则无法定位时间去向）
     rule_hits = sum(1 for f in findings if f.get("agent") != "pr-agent")
     ai_hits = sum(1 for f in findings if f.get("agent") == "pr-agent")
     return {
+        **dur,
         "ts": int(time.time()),
         "version": __version__,
         "pr": pr,
@@ -65,8 +78,9 @@ def emit(record, path=None):
     对象——如 invoke_meta 带回非预期类型时 ``json.dumps`` 抛出）。旧版只接 OSError，
     序列化错会穿出去违背契约。留 stderr 痕迹而非静默返 False——可观测性子系统自身
     绝不静默故障（同 learning_loop 2026-07-04 的防静默约定）。"""
-    p = path or METRICS_PATH
+    p = path or _metrics_path()
     try:
+        ensure_output_dir(p)   # append 是非原子写：OUTPUT_DIR 指向不存在目录时先建父目录（#90）
         with open(p, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         return True
@@ -78,7 +92,7 @@ def emit(record, path=None):
 # ---- 聚合（供 doctor / dashboard / 告警消费）--------------------------------
 def load(path=None):
     """读取 metrics 事件流为 record 列表（文件不存在返回 []）。"""
-    p = path or METRICS_PATH
+    p = path or _metrics_path()
     out = []
     try:
         with open(p, encoding="utf-8") as f:

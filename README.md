@@ -277,4 +277,5 @@ pr-agent **取 PR** 用 workflow 自带的 `GITHUB_TOKEN`——**无需额外配
 - **版本**：遵循 SemVer，版本号单一来源在 `touchstone/__init__.py`。首个公开发布 v0.1.0，历史见 `CHANGELOG.md`。
 - **可观测性**：每轮评审产出 `touchstone-metrics.json`（评审可信率、静默故障、放行率、引擎状态分布）。聚合：`python -m touchstone.metrics touchstone-metrics.json`。用于把 LLM 静默故障从"事后追问"变为"主动可见"。
 - **部署前自检**：`python -m touchstone.preflight` 校验配置完整性与连通性，含"不设就撞坑"的关键项（如 `TOUCHSTONE_LLM_CONTEXT_TOKENS` 未按模型卡设置的警告）。
+- **产物目录**：所有产物（`touchstone-findings.json` / `calibration.json` / `verify-result.json` / `touchstone-metrics.json` 及各类 `.md` 报告）默认写当前工作目录——`touchstone.yml` 依赖此默认，无需改动。**同机并发评审多个 PR** 时设 `TOUCHSTONE_OUTPUT_DIR`（如 `/tmp/ts-pr-123`）把各 PR 产物隔离到独立目录，避免同名文件互相覆盖；读写两侧统一经此解析，跨步骤传递自动对齐。既有的 `TOUCHSTONE_METRICS_PATH` / `CALIBRATION_JSON` 单文件覆盖仍优先生效。
 - **安全**：漏洞披露流程与本系统的安全边界见 `SECURITY.md`。请勿通过公开 issue 报告安全问题。

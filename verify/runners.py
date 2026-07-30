@@ -13,8 +13,11 @@
 import ast
 import os
 import re
+import secrets
 import shlex
+import shutil
 import subprocess
+import tempfile
 
 TEST_TIMEOUT = 300
 
@@ -166,30 +169,95 @@ def _parse_mutation_output(out):
 
 def external_mutation_score(work_dir, changed_files):
     """成熟工具接缝（对照 mutmut/cosmic-ray/PIT）：设 TOUCHSTONE_MUTATION_CMD 时改用外部命令
-    算击杀率——命令在 work_dir 运行，{files} 占位替换为改动文件列表，stdout 里最后一个
-    百分数/小数被当作击杀率。未设、命令失败或解析不出 → 返回 None，回退内置 AST 变异。
-    注入面收口：changed_files 来自被检 PR 的 diff——文件名是【PR author 可控输入】。命令模板
-    本身走 shell=True 是刻意的（部署方要写管道/重定向），但替换进 {files} 的每个文件名必须
-    shlex.quote：否则 author 提交名为 `x;恶意命令;.py` 的文件即可在 verify 进程注入执行
-    （恰是本仓 DANGER-001 规则点名的构造——门禁自身先过自己的门）。
-    命令失败收口（A5-F2）：rc!=0 视为命令失败 → 不解析其 stdout、返回 None。外部工具崩溃时
-    可能已把一个中途/误导性的百分数 print 到 stdout（部分跑完、segfault 前的汇总行、或工具
-    自身把进度当结果输出），若照旧 _parse_mutation_output(r.stdout) 取数 → 该数字直达
-    mutation_score → 顶过 MUT_MIN 判 adequate → 弱测试骗过变异门（与 #79 B1 同类假过）。docstring
-    既已承诺"命令失败→None"，此处按 rc 把承诺落实（默认 off 的 TOUCHSTONE_MUTATION_CMD 接缝）。"""
+    算击杀率。命令在 work_dir 运行，支持两个占位符：
+      {files}        —— 替换为改动文件列表。changed_files 来自被检 PR 的 diff，是【PR author
+                       可控输入】：author 提交名为 `x;恶意命令;.py` 的文件即可在 verify 进程注入
+                       执行（恰是 DANGER-001 点名的构造——门禁自身先过自己的门）。故每个文件名
+                       必须 shlex.quote。命令模板本身启用 shell 是刻意的（部署方要写管道/重定向），
+                       可信边界见 _run_mutation_cmd。
+      {result_file}  —— runner 在系统 temp 下随机子目录里建的文件绝对路径。工具把【真击杀率】
+                       写进它，runner 读该文件取分、**丢弃 stdout**。这是防伪主路径（见下）。
+
+    信任阶梯（#111 防伪：外部变异命令最终要跑 PR 的测试，author 的 conftest/test 可往 stdout
+    末尾喷一个高数——旧实现 _parse_mutation_output 取 stdout 最后一个数 → 顶过 MUT_MIN 判
+    adequate，弱测试骗过变异门。与 #79 B1 同类假过）：
+      · 模板含 {result_file}  → 跑命令、读结果文件第一行取分、弃 stdout（可信路径）。结果文件在
+        系统 temp 的**随机名子目录**内、文件名亦随机（堵住固定模式 glob 定位 + stdout 廉价 spoof）；
+        只读第一行防多指标报告误取末数与 append-spoof。**残留**：工具与 PR 测试同 UID、无 sandbox，
+        同 UID 可 listdir 枚举 + 覆盖文件——非彻底闭环，真正闭环需不同 UID/sandbox（详见
+        _external_score_via_result_file 的诚实标注）。
+      · 模板不含 {result_file}：默认**不**解析 stdout → 返回 None（回退内置 AST 变异）。仅当显式
+        设 TOUCHSTONE_MUTATION_TRUST_STDOUT=1 才回到旧 stdout 解析（兼容仅往 stdout 喷分数的
+        工具，但部署方知情接受 spoof 风险）。
+
+    命令失败（rc!=0）/ 超时 / 结果文件缺失或解析不出 / TIMEOUT 值畸形 → 一律返回 None，回退内置
+    变异（A5-F2：崩溃工具可能在 stdout 喷误导性百分数，绝不据此判 adequate；int() 留在 try 内，
+    畸形 TIMEOUT→ValueError→None 保 graceful degradation）。默认 off（未设 TOUCHSTONE_MUTATION_CMD
+    → return None → 回退内置 AST 变异，不受此接缝影响）。"""
     cmd = os.environ.get("TOUCHSTONE_MUTATION_CMD")
     if not cmd:
         return None
+    files_sub = " ".join(shlex.quote(f) for f in changed_files or [])
     try:
-        full = cmd.replace("{files}",
-                           " ".join(shlex.quote(f) for f in changed_files or []))
-        r = subprocess.run(full, shell=True, cwd=work_dir, capture_output=True,
-                           text=True, timeout=int(os.environ.get("TOUCHSTONE_MUTATION_TIMEOUT", "900")))
-        if r.returncode != 0:
+        timeout = int((os.environ.get("TOUCHSTONE_MUTATION_TIMEOUT") or "").strip() or "900")   # 留 try 内：畸形值→ValueError→None（保 graceful degradation）
+        if "{result_file}" in cmd:
+            return _external_score_via_result_file(cmd, files_sub, work_dir, timeout)
+        if os.environ.get("TOUCHSTONE_MUTATION_TRUST_STDOUT") != "1":
+            return None                 # #111 安全默认：旧 stdout 模板无显式 opt-in → 弃 stdout → 回退内置 AST 变异
+        r = _run_mutation_cmd(cmd.replace("{files}", files_sub), work_dir, timeout)
+        if r is None:
             return None                 # rc!=0 → 命令失败，不信 stdout（防崩溃工具的误导性输出顶满分）
         return _parse_mutation_output(r.stdout)
     except Exception:
         return None
+
+
+def _run_mutation_cmd(full, work_dir, timeout):
+    """跑外部变异命令、rc!=0 返回 None。**启用 shell**（subprocess 的 shell 模式）是
+    TOUCHSTONE_MUTATION_CMD 模板契约的固有需求——部署方依赖 shell 管道/重定向（`&&`、`>`）写
+    模板，非滥用。可信边界（DANGER-001「确需使用、已说明可信边界」）：PR 可控输入仅经 {files} 替换
+    进 full，已在调用前 shlex.quote（注入面闭合）；{result_file}（若有）是 runner 自持随机路径、亦
+    quote；模板字符串本身是部署可信 secret、非 PR 可控。故不改为 list 形式（会破坏模板契约的 shell
+    语义）。rc!=0 → None（崩溃工具可能在 stdout 喷误导性百分数，绝不据此判 adequate，A5-F2）。"""
+    r = subprocess.run(full, shell=True, cwd=work_dir, capture_output=True,
+                       text=True, timeout=timeout)
+    return None if r.returncode != 0 else r
+
+
+def _external_score_via_result_file(cmd, files_sub, work_dir, timeout):
+    """可信路径落地：runner 在系统 temp 下建**随机名子目录**、结果文件用**随机名**置于其内，工具
+    把真击杀率写进文件**第一行**（约定 score 在 line 1），runner 读第一行取分、**完全不看 stdout**。
+    随机目录名 + 随机文件名堵住了 #111 收口的廉价 spoof（往 stdout 喷假满分 + glob 固定模式定位结果
+    文件）；只读第一行同时防住工具写多指标报告误取末数、以及 append-spoof（攻击者往文件末尾 append
+    假分，不动第一行）。
+
+    **诚实标注残留风险**（非密码学不可破，部署方按 opt-in 接缝知情接受）：工具与 PR 测试**同 UID**
+    跑、且无 sandbox/chroot，故 /tmp 通常可被同 UID 枚举（`os.listdir('/tmp')` 发现随机目录、再
+    listdir 找文件）；攻击者可在工具写真分后、runner 读前**覆盖/篡改第一行**。随机化 + 只读第一行把
+    spoof 从「一行 print」抬到「同 UID 枚举 + 覆盖文件」的构造，**非彻底闭环**。真正闭环需把工具跑在
+    不同 UID 或 sandbox/private-temp（0600）下——超本 PR scope，留作未来加固方向。"""
+    result_dir = tempfile.mkdtemp(prefix=secrets.token_hex(6))
+    # 文件名亦随机化：仅随机目录名 + 固定文件名 score 仍可 glob('/tmp/<rand>/score') 命中。文件名
+    # secrets.token_hex 后顶层 /tmp 无固定前缀/后缀/文件名可 glob——堵住「固定模式 glob 定位」的廉价
+    # spoof。残留：同 UID 仍可 os.listdir 枚举（见 docstring 诚实标注）。
+    result_path = os.path.join(result_dir, secrets.token_hex(8))
+    try:
+        # 先替 {result_file} 再替 {files}：str.replace 单趟扫描、不对替换结果再扫描，故先替占位符
+        # 可避开 files_sub（PR 可控文件名）含 "{result_file}" 字面时被第二次 replace 误伤、把真
+        # result 路径注入 {files} 位置的注入面（PR 作者把文件命名成 {result_file}）。
+        full = cmd.replace("{result_file}", shlex.quote(result_path)).replace("{files}", files_sub)
+        r = _run_mutation_cmd(full, work_dir, timeout)
+        if r is None:
+            return None                 # rc!=0 → 命令失败，不信结果文件（工具崩溃可能留下中途/空文件）
+        with open(result_path, "r", encoding="utf-8") as fh:
+            # 只读第一行（约定：击杀率在 line 1）——避免工具写多指标报告（score:50%\ncoverage:80%）
+            # 取末数误判、也防 append-spoof（攻击者往末尾 append 假分，不动第一行）。
+            return _parse_mutation_output(fh.readline())
+    finally:
+        # shutil.rmtree(ignore_errors=True) 容忍目录非空：外部工具可能往 result_dir 写日志/临时产物，
+        # os.rmdir 仅删空目录会让残留文件挡住删除、泄漏随机目录（每轮一份）；ignore_errors 同时兜底
+        # 「文件未创建」与「目录非空」两种情形。
+        shutil.rmtree(result_dir, ignore_errors=True)
 
 
 _MUT_CMP = {ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Lt: ast.GtE,

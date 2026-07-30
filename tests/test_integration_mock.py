@@ -723,6 +723,92 @@ def test_govern_main(monkeypatch, tmp_path):
     assert (tmp_path / "autonomy-state.json").exists()
 
 
+def test_govern_main_fail_closed_when_revert_scan_unavailable(monkeypatch, tmp_path):
+    # detect_revert_shas 扫描失败(None) + 窗口内有自动放行 PR → govern.main 写出 tripped=True
+    # （失败收敛，非谎报健康）。锁 main() 透传 revert_data_available 的接线。
+    monkeypatch.chdir(tmp_path)
+    cal = {"aggregate": {"by_rule": {}}, "records": [
+        {"pr": 1, "merged": True, "merge_commit_sha": "abc12345", "auto_handled": True}]}
+    (tmp_path / "calibration.json").write_text(json.dumps(cal), encoding="utf-8")
+    monkeypatch.setenv("CALIBRATION_JSON", str(tmp_path / "calibration.json"))
+    monkeypatch.setenv("TOUCHSTONE_STANDARDS", os.path.join(ROOT, ".touchstone", "standards.yaml"))
+    monkeypatch.setattr(GOV, "detect_revert_shas", lambda *a, **k: None)   # 扫描失败
+    with pytest.raises(SystemExit) as ei:                                # tripped → main() sys.exit(2)
+        GOV.main()
+    assert ei.value.code == 2
+    state = json.loads((tmp_path / "autonomy-state.json").read_text(encoding="utf-8"))
+    assert state["tripped"] is True and state["revert_rate"] is None
+
+
+def test_govern_main_survives_empty_yaml_and_null_json(monkeypatch, tmp_path):
+    """PR #136（TEST-001）：空/注释-only YAML 与 null JSON 不能让 govern.main 崩。
+    回归锁：yaml.safe_load 对空/注释-only 文件返回 None；json.load 对 ``null`` 字面返回 None。
+    修复前 ``standards.get('rules', [])`` / ``cal.get('aggregate', {})`` 在 None 上 AttributeError；
+    ``or {}`` 兜底后 main() 平稳落盘两份产物（无固化候选、熔断不跳）。"""
+    monkeypatch.chdir(tmp_path)
+    # null JSON：json.load → None；or {} → {}，cal.get 不再崩
+    (tmp_path / "calibration.json").write_text("null", encoding="utf-8")
+    monkeypatch.setenv("CALIBRATION_JSON", str(tmp_path / "calibration.json"))
+    # 空（仅注释）YAML：yaml.safe_load → None；or {} → {}，standards.get 不再崩
+    empty_std = tmp_path / "standards.yaml"
+    empty_std.write_text("# 仅注释、零规则\n", encoding="utf-8")
+    monkeypatch.setenv("TOUCHSTONE_STANDARDS", str(empty_std))
+    monkeypatch.setattr(GOV, "detect_revert_shas", lambda *a, **k: set())   # 不打 git
+    GOV.main()                                                              # 不抛 AttributeError
+    proposal = (tmp_path / "promotion-proposal.md").read_text(encoding="utf-8")
+    assert "无达阈值的固化候选" in proposal                                  # 空规则→无候选，落正常分支
+    state = json.loads((tmp_path / "autonomy-state.json").read_text(encoding="utf-8"))
+    assert state["tripped"] is False                                        # 无 records → 不熔断
+
+
+def test_govern_main_survives_null_autonomy_prev(monkeypatch, tmp_path):
+    """#136 review（govern.py:181）：autonomy-prev.json 内容为 ``null`` 时 json.load → None，
+    原 ``json.load(f).get('approval_rate')`` 在 None 上 AttributeError（不在 (JSONDecodeError,KeyError) 捕获域）。
+    ``(json.load(f) or {}).get(...)`` 兜底后 main() 平稳读出 prior=None。回归锁：去 or {} 即在 .get 上崩。"""
+    monkeypatch.chdir(tmp_path)
+    cal = {"aggregate": {"by_rule": {}}, "records": []}
+    (tmp_path / "calibration.json").write_text(json.dumps(cal), encoding="utf-8")
+    monkeypatch.setenv("CALIBRATION_JSON", str(tmp_path / "calibration.json"))
+    monkeypatch.setenv("TOUCHSTONE_STANDARDS", os.path.join(ROOT, ".touchstone", "standards.yaml"))
+    (tmp_path / "autonomy-prev.json").write_text("null", encoding="utf-8")   # null → json.load 返 None
+    monkeypatch.setattr(GOV, "detect_revert_shas", lambda *a, **k: set())
+    GOV.main()                                                               # 不抛 AttributeError
+    assert (tmp_path / "autonomy-state.json").exists()
+
+
+@pytest.mark.parametrize("module,fn,kind", [
+    ("checks", "load_config", "dict"),
+    ("contract_check", "load_scope_rules", "dict"),
+    ("review_provider", "load_nmap", "dict"),
+    ("gen_best_practices", "generate", "str"),
+])
+def test_yaml_loaders_empty_file_returns_safe_value_not_none(tmp_path, monkeypatch, module, fn, kind):
+    """PR #136（TEST-001）：全仓裸 open()→with 扫描把 4 个 YAML 加载站的 ``or {}`` 搬进 with 块。
+    不变量锁：空/注释-only YAML（safe_load → None）必须兜底成空字典，绝不把 None 透传到下游 ``.get``。
+    任一站点误删 ``or {}`` 都会在此复现 ``AttributeError: 'NoneType' ... .get``。"""
+    import importlib
+    m = importlib.import_module(f"touchstone.{module}")
+    ts = tmp_path / ".touchstone"; ts.mkdir()
+    target = {
+        "checks":              tmp_path / "checks.yaml",
+        "contract_check":      ts / "scope-rules.yaml",
+        "review_provider":     ts / "pr-agent.yaml",
+        "gen_best_practices":  tmp_path / "standards.yaml",
+    }[module]
+    target.write_text("# 仅注释、零键\n", encoding="utf-8")                # safe_load → None
+    # hermetic（#136 review #2）：清可能劫持默认路径的 env——review_provider.load_nmap 读 TOUCHSTONE_PRAGENT
+    # 先于默认路径，CI/前序测试若设了它，本用例会读错文件；checks 则显式 setenv 覆盖到 tmp 目标。
+    monkeypatch.delenv("TOUCHSTONE_PRAGENT", raising=False)
+    if module == "checks":
+        monkeypatch.setenv("TOUCHSTONE_CHECKS", str(target))
+    if module == "gen_best_practices":
+        out = getattr(m, fn)(str(target))
+    else:
+        out = getattr(m, fn)(str(tmp_path))
+    assert out is not None, f"{module}.{fn} 对空 YAML 返回 None——``or {{}}`` 兜底丢了"
+    assert isinstance(out, dict if kind == "dict" else str)
+
+
 # ============================ calibrate ============================
 from touchstone import calibrate as CAL            # noqa: E402
 from touchstone import autonomy as AUT             # noqa: E402
@@ -778,6 +864,38 @@ def test_calibrate_main(monkeypatch, tmp_path, capsys):
     assert rep["aggregate"]["total"] == 1 and (tmp_path / "calibration-report.md").exists()
 
 
+def test_calibrate_main_excludes_author_self_resolve(monkeypatch, tmp_path, capsys):
+    """calibrate.main() 须传 pr_author 给 thread_findings——作者自 resolve 自己 PR 的发现线程
+    不算采纳，否则 finding_adoption 被污染、adoption_rate 虚高致 graduate/retire 误判。
+    与 build_ground_truth 同一 bug 类。锁死调用点 pr_author 透传：删参数（变异）→
+    finding_adoption[0].resolved 变 True → 本测红。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    body = ('<!-- touchstone-finding: '
+            + json.dumps({'rule_id': 'PRA-X', 'agent': 'pr-agent:review'}) + ' -->')
+    threads = [{'isResolved': True, 'resolved_by': 'author1',     # 作者 = 线程解决者
+                'comments': [{'author': 'github-actions[bot]', 'body': body}]}]
+
+    def fake_gh(path, token):
+        if "/pulls?state=closed" in path:
+            return [{"number": 1, "merged_at": "t", "merge_commit_sha": "sha",
+                     "user": {"login": "author1"}}]
+        if "/issues/1/comments" in path:
+            return [{"body": _RESULT_MARKER, "user": {"login": "github-actions[bot]"}}]
+        if "/pulls/1/reviews" in path:
+            return [{"user": {"login": "alice"}, "state": "APPROVED"}]
+        return []
+    monkeypatch.setattr(CAL, "gh", fake_gh)
+    monkeypatch.setattr(CAL, "gh_paginate", fake_gh)
+    monkeypatch.setattr(CAL, "fetch_review_threads", lambda *a: threads)
+    CAL.main()
+    rep = json.loads((tmp_path / "calibration.json").read_text(encoding="utf-8"))
+    fa = rep["records"][0]["finding_adoption"]
+    assert fa and fa[0]["rule_id"] == "PRA-X"
+    assert fa[0]["resolved"] is False     # 作者自 resolve → 不算采纳（传 pr_author 才成立）
+
+
 # ============================ autonomy main / execute ============================
 def test_autonomy_main_graduate(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -788,6 +906,92 @@ def test_autonomy_main_graduate(monkeypatch, tmp_path):
     AUT.main()
     grad = json.loads((tmp_path / "graduated-classes.json").read_text(encoding="utf-8"))
     assert "x" in grad["graduated_classes"]
+
+
+# ============================ #90 round-2: OUTPUT_DIR / CALIBRATION_JSON 读写一致性 ============================
+def test_calibrate_main_writes_to_calibration_json_override(monkeypatch, tmp_path):
+    """#90 finding calibrate.py:328 — 设 CALIBRATION_JSON 时写方须写到该路径（与读方
+    govern/autonomy 的 override_env 对齐）。旧代码漏 override_env → 写 OUTPUT_DIR/calibration.json
+    而读方读 CALIBRATION_JSON，毕业判据建在错文件上。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    custom = tmp_path / "sub" / "my-cal.json"            # 非默认名+子目录，排除巧合
+    monkeypatch.setenv("CALIBRATION_JSON", str(custom))
+
+    def fake_gh(path, token):
+        if "/pulls?state=closed" in path:
+            return [{"number": 1, "merged_at": "t", "merge_commit_sha": "sha"}]
+        if "/issues/1/comments" in path:
+            return [{"body": _RESULT_MARKER, "user": {"login": "github-actions[bot]"}}]
+        if "/pulls/1/reviews" in path:
+            return [{"user": {"login": "alice"}, "state": "APPROVED"}]
+        return []
+    monkeypatch.setattr(CAL, "gh", fake_gh)
+    monkeypatch.setattr(CAL, "gh_paginate", fake_gh)
+    monkeypatch.setattr(CAL, "fetch_review_threads", lambda *a: [])
+    CAL.main()
+    assert custom.exists(), "calibrate 未写到 CALIBRATION_JSON 指定路径（写方漏 override_env）"
+    assert not (tmp_path / "calibration.json").exists(), "写了默认名而非 CALIBRATION_JSON 覆盖"
+
+
+def test_autonomy_graduate_reads_calibration_json_override(monkeypatch, tmp_path):
+    """#90 finding autonomy.py:278 — 设 CALIBRATION_JSON 时读方须从该路径读（与写方 calibrate
+    override_env 对齐）。CWD 放一份【空】calibration.json 作诱饵：读方若漏 override_env 会读到
+    空记录→graduate 空；正确读 CALIBRATION_JSON 才拿到 20 条 x→graduate 出 x。"""
+    monkeypatch.chdir(tmp_path)
+    custom = tmp_path / "sub" / "my-cal.json"
+    custom.parent.mkdir(parents=True)
+    recs = [{"merged": True, "change_class": "x", "loop_decision": "converged",
+             "findings": [], "risk_band": "low", "merge_commit_sha": "s"} for _ in range(20)]
+    custom.write_text(json.dumps({"records": recs}), encoding="utf-8")
+    monkeypatch.setenv("CALIBRATION_JSON", str(custom))
+    (tmp_path / "calibration.json").write_text(json.dumps({"records": []}), encoding="utf-8")  # 诱饵
+    monkeypatch.setattr(sys, "argv", ["autonomy", "--graduate"])
+    AUT.main()
+    grad = json.loads((tmp_path / "graduated-classes.json").read_text(encoding="utf-8"))
+    assert "x" in grad["graduated_classes"], "autonomy 未从 CALIBRATION_JSON 读校准（读方漏 override_env）"
+
+
+def test_autonomy_decision_reads_graduated_classes_from_output_dir(monkeypatch, tmp_path, capsys):
+    """#90/#122 OUTPUT_DIR 统一漏掉的读点 autonomy.py:340 —— 决策模式读 graduated-classes.json 曾走
+    【裸文件名】，而写方（autonomy.py:322 --graduate）走 artifact_path。设 TOUCHSTONE_OUTPUT_DIR 时
+    写进隔离目录、读方却去 CWD 找 → 读不到 → graduated_classes 空 → class_graduated 永远 fail
+    （autonomy 对该部署彻底失效，且是静默失效）。CWD 放【空】graduated-classes.json 作诱饵：读方若漏
+    artifact_path 会读诱饵→class_graduated fail；正确读 OUTPUT_DIR 才拿到类→class_graduated pass。"""
+    out = tmp_path / "iso"
+    out.mkdir()
+    monkeypatch.setenv("TOUCHSTONE_OUTPUT_DIR", str(out))
+    monkeypatch.chdir(tmp_path)                          # CWD 下放【空】诱饵（非 OUTPUT_DIR）
+    (tmp_path / "graduated-classes.json").write_text(
+        json.dumps({"graduated_classes": []}), encoding="utf-8")          # 诱饵：空
+    (out / "graduated-classes.json").write_text(
+        json.dumps({"graduated_classes": ["low|code|none|none"]}), encoding="utf-8")  # 真值在 OUTPUT_DIR
+    co = {"gate": "success", "risk": {"risk_band": "low"}, "findings": [], "loop_decision": "converged",
+          "change_class": "low|code|none|none", "review_reliable": True, "unverified_claims": 0,
+          "added_lines": 10, "author": {"login": "alice", "association": "MEMBER"}, "pr": 1, "sha": "abc"}
+    (out / "touchstone-findings.json").write_text(json.dumps(co), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["autonomy"])       # 决策模式（无 --inputs）→ 走 graduated-classes 读路径
+    AUT.main()
+    dec = json.loads(capsys.readouterr().out)
+    assert "class_graduated" not in dec["failed"], \
+        "决策模式未从 OUTPUT_DIR 读 graduated-classes（读方漏 artifact_path，读到 CWD 空诱饵→class_graduated fail）"
+
+
+def test_check_verify_reads_result_from_output_dir(monkeypatch, tmp_path):
+    """#90 finding checks.py:190 — _check_verify 须与写出方 verify_change.py 同路径（artifact_path）。
+    设 TOUCHSTONE_OUTPUT_DIR 时 verify-result.json 落隔离目录；读方也须去那找，否则静默记
+    'verify 未运行' 把 verify 结论漏出总闸。"""
+    import json as _json
+    from touchstone import checks
+    out = tmp_path / "iso"
+    out.mkdir()
+    monkeypatch.setenv("TOUCHSTONE_OUTPUT_DIR", str(out))
+    monkeypatch.chdir(tmp_path)                          # CWD 下【故意不放】verify-result.json
+    (out / "verify-result.json").write_text(
+        _json.dumps({"passed": True, "spec_source": "human_curated"}), encoding="utf-8")
+    passed, msg = checks._check_verify({}, {})
+    assert passed is True, f"未从 OUTPUT_DIR 读到 verify 结果（读方漏 artifact_path）: {msg}"
 
 
 def test_autonomy_main_decision_inputs(monkeypatch, tmp_path, capsys):

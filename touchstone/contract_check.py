@@ -292,7 +292,8 @@ def load_scope_rules(repo_dir="."):
     path = os.path.join(repo_dir, ".touchstone", "scope-rules.yaml")
     rules = {k: list(v) for k, v in _DEFAULT_SCOPE_RULES.items()}
     try:
-        data = yaml.safe_load(open(path, encoding="utf-8")) or {}
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
         for factor, pats in (data.get("factors") or {}).items():
             if isinstance(pats, list) and pats:
                 rules[str(factor)] = [str(p) for p in pats]

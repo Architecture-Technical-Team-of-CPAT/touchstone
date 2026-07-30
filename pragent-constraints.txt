@@ -1,3 +1,6 @@
+# 前提：Python >= 3.13（上游报告问题六）。pr-agent 0.39 在 python<3.13 钉
+# google-cloud-storage==2.10.0，与本文件的 3.12.0 冲突 → pip ResolutionImpossible；
+# 且安装步 continue-on-error 会把该失败静默成"AI 评审未运行"的优雅降级，根因不醒目。
 # pragent-constraints.txt —— PR-Agent venv 复现锁（.pragent-venv，与主仓 constraints.txt 平行）
 # 用法（touchstone.yml 已接线）：pip install pr-agent==<PRA_VERSION> -c pragent-constraints.txt
 #

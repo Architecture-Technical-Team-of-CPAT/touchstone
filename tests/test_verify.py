@@ -362,18 +362,179 @@ def test_parse_mutation_output_takes_last_number():
 
 def test_external_mutation_cmd_used_when_set(monkeypatch, tmp_path):
     from verify import verify_change as V
+    # #111 安全默认：旧 stdout 模板（无 {result_file}）未显式 opt-in → 弃 stdout → None（回退内置）
+    monkeypatch.delenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", raising=False)
     monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "echo killed 3/4 = 75%")
+    assert V.external_mutation_score(str(tmp_path), ["a.py"]) is None
+    # 显式 opt-in（部署方知情接受 spoof 风险）→ 回到 legacy stdout 解析
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", "1")
     assert V.external_mutation_score(str(tmp_path), ["a.py"]) == 0.75
     monkeypatch.delenv("TOUCHSTONE_MUTATION_CMD")
     assert V.external_mutation_score(str(tmp_path), ["a.py"]) is None   # 未设 → 回退内置
 
 
+def test_external_mutation_score_result_file_trusted(monkeypatch, tmp_path):
+    """#111 可信路径：模板含 {result_file} → 工具把分写进 runner 指定的临时文件，runner 读文件取分。"""
+    from verify import verify_change as V
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "echo 83% > {result_file}")
+    monkeypatch.delenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", raising=False)   # 不需要 opt-in：{result_file} 即可信
+    assert V.external_mutation_score(str(tmp_path), ["a.py"]) == 0.83
+
+
+def test_external_mutation_score_result_file_not_spoofed_by_stdout(monkeypatch, tmp_path):
+    """#111 spoof-killer：命令往 stdout 喷假满分 99%，但写真击杀率 0.05 进 {result_file}。
+    修复后取文件真值 0.05（< MUT_MIN），**不**取 stdout 的 0.99——堵 author 经 conftest 往 stdout
+    末尾喷高数顶过变异门。若退回读 stdout（变异：弃文件改 parse stdout），本测拿到 0.99 即杀红。"""
+    from verify import verify_change as V
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "echo killed 99%; echo 0.05 > {result_file}")
+    monkeypatch.delenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", raising=False)
+    score = V.external_mutation_score(str(tmp_path), ["a.py"])
+    assert score == 0.05                # 真值，非 stdout 的 0.99
+    assert score < 0.6                  # 弱测试不会被顶过 MUT_MIN
+
+
+def test_external_mutation_score_result_file_unwritten_not_stdout(monkeypatch, tmp_path):
+    """#111：rc==0、命令往 stdout 喷假满分、但没往 {result_file} 写可解析分 → None（不退回 stdout 顶分）。
+    命令**含 {result_file}** 故真进入 `_external_score_via_result_file`；`echo 99%` 喷 stdout、`true` 忽略
+    {result_file} 不写（mkstemp 预建空文件）→ 读得空 → _parse_mutation_output('') → None。若可信路径
+    错误退回 stdout 会拿到 0.99 → 杀红（堵住「文件空就 fallback stdout」的回归）。"""
+    from verify import verify_change as V
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "echo 99%; true {result_file}")
+    monkeypatch.delenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", raising=False)
+    assert V.external_mutation_score(str(tmp_path), ["a.py"]) is None
+
+
+def test_external_mutation_score_result_file_random_filename(monkeypatch, tmp_path):
+    """round-4 PRA-SECURITY:230 / PRA-REVIEW:230：结果文件名必须随机化。仅随机目录名 + 固定文件名
+    score 仍可 glob('/tmp/<rand>/score') 命中（PR 代码跑为工具孙进程、可枚举任意子目录）。断言命令里
+    结果文件 basename 是 secrets.token_hex(8)=16 hex 字符、非固定 'score'。变异（文件名改回 'score'）
+    → basename=='score' → 杀红。"""
+    import re
+    captured = {}
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "echo 50% > {result_file}")
+    monkeypatch.delenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", raising=False)
+
+    def fake_run(full, wd, to):
+        captured["full"] = full
+        m = re.search(r">\s*(\S+)", full)        # 结果文件路径（shlex.quote 对纯安全路径不加引号 → 裸或引号皆可能）
+        if m:
+            open(m.group(1).strip("';"), "w").write("50%")
+        return type("_R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(R, "_run_mutation_cmd", fake_run)
+    assert R.external_mutation_score(str(tmp_path), ["a.py"]) == 0.5
+    m = re.search(r">\s*(\S+)", captured["full"])
+    assert m, captured["full"]
+    basename = os.path.basename(m.group(1).strip("';"))
+    assert basename != "score", f"固定文件名 score 仍可 glob('/tmp/<rand>/score') 枚举: {basename}"
+    assert re.fullmatch(r"[0-9a-f]{16}", basename), f"期望随机 hex 文件名(token_hex(8)): {basename}"
+
+
+def test_external_mutation_score_cleans_nonempty_temp_dir(monkeypatch, tmp_path):
+    """round-4 PRA-GENERAL:240：外部工具可能往 result_dir 写额外产物（日志/临时文件），os.rmdir 仅删
+    空目录会让残留文件挡住删除、泄漏随机目录（每轮一份）。shutil.rmtree(ignore_errors=True) 容忍非空、
+    保证清理。变异（rmtree 改回 os.rmdir）→ 非空目录删不掉、残留 → 断言目录已删失败 → 杀红。"""
+    import re
+    created = []
+    real_mkdtemp = R.tempfile.mkdtemp
+
+    def spy_mkdtemp(*a, **k):
+        d = real_mkdtemp(*a, **k)
+        created.append(d)
+        return d
+
+    def fake_run(full, wd, to):
+        m = re.search(r">\s*(\S+)", full)        # 结果文件路径（shlex.quote 对纯安全路径不加引号 → 裸或引号皆可能）
+        if m:
+            open(m.group(1).strip("';"), "w").write("50%")
+            # 工具顺手往同一目录写额外产物（os.rmdir 删不掉的元凶）
+            open(os.path.join(os.path.dirname(m.group(1).strip("';")), "tool.log"), "w").write("x")
+        return type("_R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(R.tempfile, "mkdtemp", spy_mkdtemp)
+    monkeypatch.setattr(R, "_run_mutation_cmd", fake_run)
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "echo 50% > {result_file}")
+    monkeypatch.delenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", raising=False)
+    assert R.external_mutation_score(str(tmp_path), ["a.py"]) == 0.5
+    assert created, "mkdtemp 应被调用"
+    assert not os.path.exists(created[0]), f"非空目录应被 shutil.rmtree 清理，仍残留: {created[0]}"
+
+
+def test_external_mutation_score_replace_order_safe(monkeypatch, tmp_path):
+    """round-4 PRA-REVIEW:233：chained .replace() 顺序注入面。PR 作者把文件命名成 '{result_file}'，
+    files_sub 会含 '{result_file}' 字面。若先替 {files} 再替 {result_file}（旧顺序），第二次 replace 会
+    把真 result 路径注入 {files} 位置、泄漏隐藏路径。换序（先 {result_file} 后 {files}；str.replace 单趟
+    扫描、不对结果再扫描）可避。变异（换回旧顺序）→ {files} 位出现真路径而非文件名字面 → 杀红。"""
+    import re
+    captured = {}
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "echo 50% > {result_file}; touch {files}")
+    monkeypatch.delenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", raising=False)
+
+    def fake_run(full, wd, to):
+        captured["full"] = full
+        m = re.search(r">\s*(\S+)", full)        # 结果文件路径（shlex.quote 对纯安全路径不加引号 → 裸或引号皆可能）
+        if m:
+            open(m.group(1).strip("';"), "w").write("50%")
+        return type("_R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(R, "_run_mutation_cmd", fake_run)
+    # 文件名是 PR 可控的 '{result_file}' 字面（注入触发条件）
+    assert R.external_mutation_score(str(tmp_path), ["{result_file}"]) == 0.5
+    # 换序正确：{files} 位保留文件名字面 '{result_file}'（quote 后），真路径不泄漏到此位
+    assert "touch '{result_file}'" in captured["full"], captured["full"]
+
+
+def test_external_mutation_score_result_file_first_line_only(monkeypatch, tmp_path):
+    """round-5 PRA-REVIEW:245：结果文件可能含多指标（score:50%\\ncoverage:80%）。_parse_mutation_output
+    取末数 → 0.80（错，应取击杀率 0.50）。修复：只读第一行（约定 score 在 line 1）。变异（readline
+    改回 read 全文件 + 取末数）→ 0.80 → 杀红。"""
+    import re
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "tool > {result_file}")
+    monkeypatch.delenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", raising=False)
+
+    def fake_run(full, wd, to):
+        m = re.search(r">\s*(\S+)", full)
+        if m:
+            # 工具写多指标报告：第一行 score，第二行 coverage
+            open(m.group(1).strip("';"), "w").write("score: 50%\ncoverage: 80%\n")
+        return type("_R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(R, "_run_mutation_cmd", fake_run)
+    score = R.external_mutation_score(str(tmp_path), ["a.py"])
+    assert score == 0.50, f"应取第一行击杀率 0.50，而非末数 coverage 0.80: {score}"
+
+
+def test_external_mutation_score_result_file_append_spoof_blocked(monkeypatch, tmp_path):
+    """round-5：攻击者（同 UID conftest）在工具写真击杀率后、runner 读前，往结果文件末尾 append 假
+    满分。只读第一行（工具写的真分）→ append 到后续行不影响 → 安全。变异（readline 改回 read 全文件
+    + 取末数）→ 0.99 → 杀红。"""
+    import re
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "tool > {result_file}")
+    monkeypatch.delenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", raising=False)
+
+    def fake_run(full, wd, to):
+        m = re.search(r">\s*(\S+)", full)
+        if m:
+            target = m.group(1).strip("';")
+            open(target, "w").write("0.05\n")          # 工具写真（弱）击杀率
+            with open(target, "a") as f:                # 攻击者 append 假满分
+                f.write("0.99\n")
+        return type("_R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(R, "_run_mutation_cmd", fake_run)
+    score = R.external_mutation_score(str(tmp_path), ["a.py"])
+    assert score == 0.05, f"append-spoof 应被只读第一行挡住，取工具真分 0.05: {score}"
+    assert score < 0.6
+
+
 def test_external_mutation_cmd_hostile_filename_not_executed(monkeypatch, tmp_path):
     """注入面回归锁：changed_files 的文件名是 PR author 可控输入。名为 `x; 命令;` 的
     文件不得在 shell 里逃逸执行——quote 后它只是 `true` 的一个普通参数。若逃逸，
-    ① work_dir 会出现 INJECTED 文件，② 击杀率会被注入的 `echo 0.99` 篡改为 0.99。"""
+    ① work_dir 会出现 INJECTED 文件，② 击杀率会被注入的 `echo 0.99` 篡改为 0.99。
+    走 legacy stdout 路径（TRUST_STDOUT=1）以实际执行命令、抵达 {files} 替换点。"""
     from verify import verify_change as V
     hostile = "x.py; touch INJECTED; echo 0.99;"
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", "1")
     monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "true {files}; echo 0.5")
     assert V.external_mutation_score(str(tmp_path), [hostile]) == 0.5
     assert not (tmp_path / "INJECTED").exists()
@@ -385,12 +546,15 @@ def test_external_mutation_cmd_nonzero_rc_not_trusted(monkeypatch, tmp_path):
     百分数（部分跑完 / segfault 前的汇总行 / 把进度当结果输出），旧实现照旧
     _parse_mutation_output(r.stdout) 取数 → 该数字直达 mutation_score → 顶过 MUT_MIN 判
     adequate → 弱测试骗过变异门（与 #79 B1 同类假过）。
-    `echo killed 90%; false` 模拟：stdout 有 90%，但整体 rc=1（false 退出码）。"""
+    走 legacy stdout 路径（TRUST_STDOUT=1）以实际执行命令，rc 守卫才被真实抵达。
+    `echo killed 90%; false` 模拟：stdout 有 90%，但整体 rc=1（false 退出码）。
+    删 rc 守卫（变异）后本测会拿到 0.9 而非 None → 杀红。"""
     from verify import verify_change as V
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", "1")
     monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "echo killed 90%; false")
     assert V.external_mutation_score(str(tmp_path), ["a.py"]) is None
     # 对照：rc=0 时正常解析（保留接缝行为、rc 守卫不误伤）——锁 test_external_mutation_cmd_used_when_set
-    # 的同一侧：删 rc 守卫后本测会拿到 0.9 而非 None（变异杀红）。
+    # 的 opt-in 同一侧。
 
 
 # ---------------- 纯函数补测 ----------------
@@ -821,9 +985,10 @@ def test_run_success_timeout_notfound(monkeypatch):
 
 
 def test_external_mutation_cmd_parse_and_fail(monkeypatch, tmp_path):
-    # 设了 cmd + 正常百分数输出 → 解析击杀率
+    # 走 legacy stdout 路径（TRUST_STDOUT=1）：设了 cmd + 正常百分数输出 → 解析击杀率
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", "1")
     monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "echo mutation score: 75%")
     assert V.external_mutation_score(str(tmp_path), ["a.py"]) == 0.75
-    # cmd 抛错 → None
+    # cmd 抛错（rc!=0）→ None
     monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "false")
     assert V.external_mutation_score(str(tmp_path), ["a.py"]) is None

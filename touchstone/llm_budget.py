@@ -32,7 +32,7 @@ def _enc():
 def context_tokens():
     """模型上下文窗口（token）。0 = 未声明/不限。"""
     try:
-        return int(os.environ.get("TOUCHSTONE_LLM_CONTEXT_TOKENS", "0") or 0)
+        return int((os.environ.get("TOUCHSTONE_LLM_CONTEXT_TOKENS") or "").strip() or "0")
     except ValueError:
         return 0
 
@@ -41,7 +41,7 @@ def output_tokens():
     """模型最大输出（token）。注意：pr-agent 的 custom_model_max_tokens【不】用它——
     那是输入侧上下文窗口预算，用 context_tokens()。本值供 touchstone 自身摘要/截断参考。"""
     try:
-        v = int(os.environ.get("TOUCHSTONE_LLM_OUTPUT_TOKENS", "4096") or 4096)
+        v = int((os.environ.get("TOUCHSTONE_LLM_OUTPUT_TOKENS") or "").strip() or "4096")
         return v if v > 0 else 4096
     except ValueError:
         return 4096
@@ -52,7 +52,9 @@ def est_tokens(text):
     text = text or ""
     enc = _enc()
     if enc:
-        return len(enc.encode(text))
+        # tiktoken 路径同样套 max(1,·)：空串 encode 出 []→0，违反本函数"空串给 1（避免 0 除）"
+        # 契约（启发式分支已 max(1,·)；tiktoken 装好时原裸 len 会返 0，让 est_tokens("")==1 的测试挂）。
+        return max(1, len(enc.encode(text)))
     # 启发式：CJK 约 1 字符/token、ASCII 代码约 3-4 字符/token → 折中 3
     return max(1, len(text) // 3)
 

@@ -30,11 +30,22 @@ def test_mutation_check_no_py_files_returns_one():
 def test_external_mutation_cmd_timeout_returns_none(monkeypatch, tmp_path):
     # 外部变异命令超时（真抛）→ None，回退内置
     import subprocess as sp
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_TRUST_STDOUT", "1")   # 走 legacy 路径以真抵达 subprocess.run
     monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "sleep 5")
     monkeypatch.setenv("TOUCHSTONE_MUTATION_TIMEOUT", "1")
     # 真跑 sleep 会等 1s 超时；改用直接打桩 TimeoutExpired 更快更稳
     monkeypatch.setattr(V.subprocess, "run",
                         lambda *a, **k: (_ for _ in ()).throw(sp.TimeoutExpired(cmd="x", timeout=1)))
+    assert V.external_mutation_score(str(tmp_path), ["a.py"]) is None
+
+
+def test_external_mutation_cmd_malformed_timeout_returns_none(monkeypatch, tmp_path):
+    """round-2 PRA-REVIEW:195 / PRA-POSSIBLE_ISSUE:195：TOUCHSTONE_MUTATION_TIMEOUT 畸形（非数字，
+    如部署 typo `30s`）→ int() 抛 ValueError。int() 必须在 try 内 → 被吞 → None（graceful degradation，
+    回退内置变异），不得向调用方抛 ValueError 崩 verify pipeline。把 int() 挪回 try 外（变异）→
+    本测会拿 ValueError 而非 None → 杀红。"""
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_CMD", "echo 75%")
+    monkeypatch.setenv("TOUCHSTONE_MUTATION_TIMEOUT", "30s")   # 非数字
     assert V.external_mutation_score(str(tmp_path), ["a.py"]) is None
 
 

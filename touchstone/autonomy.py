@@ -18,6 +18,7 @@ import sys
 from touchstone import ghclient   # GitHub HTTP 统一入口（连接池+退避）
 from touchstone import review_provider  # review_reliable（引擎健康度判据）
 from touchstone.atomicio import atomic_write_json
+from touchstone.artifacts import artifact_path
 
 
 def _envbool(k):
@@ -26,8 +27,8 @@ def _envbool(k):
 
 AUTONOMY_ENABLED = _envbool("AUTONOMY_ENABLED")       # 总开关，默认关
 AUTONOMY_SHADOW = _envbool("AUTONOMY_SHADOW")         # 影子模式，默认关
-GRAD_MIN_SAMPLES = int(os.environ.get("GRAD_MIN_SAMPLES", "20"))
-GRAD_MAX_BAD_RATE = float(os.environ.get("GRAD_MAX_BAD_RATE", "0.05"))
+GRAD_MIN_SAMPLES = int((os.environ.get("GRAD_MIN_SAMPLES") or "").strip() or "20")
+GRAD_MAX_BAD_RATE = float((os.environ.get("GRAD_MAX_BAD_RATE") or "").strip() or "0.05")
 
 
 # --- 变更分类签名（经验在此粒度累积/毕业）------------------------------------
@@ -296,7 +297,8 @@ def graduate_from_calibration(records, reverted_shas=None):
 
 def _load(path):
     try:
-        return json.load(open(path, encoding="utf-8"))
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -312,10 +314,13 @@ def main():
 
     # 模式一：发布达标变更分类（govern 定时任务用）
     if args.graduate:
-        cal = _load("calibration.json") or {}
+        # override_env="CALIBRATION_JSON" 与写方（calibrate.py）+ 另一读方（govern.py）对齐，
+        # 否则设了 CALIBRATION_JSON 时读 OUTPUT_DIR/calibration.json 而写 CALIBRATION_JSON→graduate
+        # 模式拿不到校准数据（#90 round-1 finding autonomy.py:278）
+        cal = _load(artifact_path("calibration.json", override_env="CALIBRATION_JSON")) or {}
         grad = sorted(graduate_from_calibration(cal.get("records", [])))
         # 原子：这份毕业类清单直接决定哪些 change_class 可被自动放行，半文件不可接受
-        atomic_write_json("graduated-classes.json", {"graduated_classes": grad})
+        atomic_write_json(artifact_path("graduated-classes.json"), {"graduated_classes": grad})
         print(f"[autonomy] 达标变更分类 {len(grad)}：{grad}")
         return
 
@@ -326,14 +331,18 @@ def main():
                                            d.get("changed_files", []), d.get("rule_index", {}))
         repo, pr, sha = d.get("repo"), d.get("pr"), d.get("sha")
     else:
-        co = _load("touchstone-findings.json")
+        co = _load(artifact_path("touchstone-findings.json"))
         if not co:
             print("[autonomy] 无 touchstone 产物；no-op（默认不放行）")
             return
         d = build_decision_inputs(
             co,
             {"tripped": os.environ.get("AUTONOMY_TRIPPED") == "true"},
-            (_load("graduated-classes.json") or {}).get("graduated_classes", []))
+            # 须与写方（line 322 --graduate 的 artifact_path）同路径：设 TOUCHSTONE_OUTPUT_DIR 时
+            # 写进隔离目录、读方却去 CWD → 读不到 → graduated_classes 空 → class_graduated 永远 fail
+            # （autonomy 对该部署彻底失效）。#90/#122 OUTPUT_DIR 统一漏掉的读点（与 calibration.json/
+            # touchstone-findings.json 读法对齐）。
+            (_load(artifact_path("graduated-classes.json")) or {}).get("graduated_classes", []))
         cls = d["cls"]
         repo = os.environ.get("GITHUB_REPOSITORY")
         pr, sha = co.get("pr"), co.get("sha")

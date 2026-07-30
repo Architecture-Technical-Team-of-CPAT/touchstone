@@ -129,6 +129,23 @@ def test_autonomy_drift_computed():
     assert out["approval_rate"] == 1.0 and out["approval_drift"] == 1.0
 
 
+def test_autonomy_fail_closed_when_revert_scan_unavailable():
+    # revert 扫描失败 + 窗口内有自动处理 PR → 失败收敛 tripped（不谎报 revert_rate=0.0/健康）。
+    # 旧实现（detect_revert_shas 失败返空集 → 这里全 reverted=False）算出 revert_rate=0.0、不 tripped
+    # = 安全熔断在取不到真值时维持自主继续放行（fail-open）。本测锁死修复。
+    recs = [{"auto_handled": True, "reverted": False, "hotfixed": False}] * 3
+    out = govern.update_autonomy(recs, revert_data_available=False)
+    assert out["tripped"] is True and out["revert_rate"] is None
+    assert any("扫描失败" in r for r in out["reasons"])
+
+
+def test_autonomy_no_trip_when_scan_unavailable_but_nothing_auto():
+    # 无自动处理 PR 时即便测不到也无放行可收回 → 不误 tripped（避免无意义噪声/误报）。
+    recs = [{"auto_handled": False, "touchstone_approved": True}]
+    out = govern.update_autonomy(recs, revert_data_available=False)
+    assert out["tripped"] is False
+
+
 # ---------------- govern.build_merge_records（读真实 auto_handled marker）----------
 def test_build_merge_records_uses_marker_not_low_risk():
     records = [

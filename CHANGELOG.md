@@ -5,6 +5,27 @@
 
 ## [未发布]
 
+### Probe：测试有效性探针（新模块）
+
+补上 Touchstone 缺失的「测试相对于行为」审查层——回答「『测试全绿』本身可信吗」。对标 dev-loop 变异探针实践与 AKDI fail-open 实证（lint 零文件检查恒 exit 0、冒烟 11/63 skip 计通过）。设计见 `docs/touchstone-probe-design.md`（随 docs/probe-design 分支独立 PR 交付，SIZE-001 拆分）。
+
+- **L0 断言普查（静态·`census`）**：不跑测试，静态揪四类假测试——skip 计通过 / 零断言 / 恒真弱断言（assert True、assertIsNotNone）/ 吞异常。
+- **L1 变异探针（动态·`plan`+`run`）**：锚定 ScopeFacts 增量函数，按（分支数 × 低断言密度）选点，套最小高价值算子集（CMP/BOOL/CONST/RET/EXC，纯 stdlib `ast`，零第三方），预算内注入→定向跑测→恢复源码→五态判决。
+- **抗自身 fail-open**：每轮追加哨兵变异体、最先执行，哨兵未被击杀即判本轮 `invalid` 并作废全部判决（never silent）；`plan_empty` 显式汇报「没做事」不给假绿灯；`ProbeRunReport` 强制全计数。
+- **接现有闭环**：`to_findings` 把 survived 转标准 Finding（`done_criteria` = replay 击杀该变异体，机器可验证），并入 checklist 四态收敛 + ack；`mutant_id` 为内容指纹，接 lineage 跨轮记账；`replay` 下一轮定向复验，击杀即闭环。
+- 边界：增量抽样非全库、不替代测试运行器、不自动改测试；等价变异体走 ack 人裁；Go 引擎/全库基线棘轮留待 M2。
+- 新增 `touchstone/probe.py`（~350 行）+ 13 测试（静态快测 + 真跑 pytest 的 run/replay 端到端）。
+
+### 运维加固（集成方 CI 耗时上游报告，中位 351s→117s 的经验固化）
+
+- **缓存写入（问题一，影响所有模板集成方）**：GitHub 2026-06-26 起 `pull_request_target` 对默认分支缓存只读，save 永久失败且被 `continue-on-error` 静默为黄警告（"针对瞬态故障的容错在故障变永久后成为静默器"）。`touchstone.yml` 改 restore-only、权限降 `actions: read`；新增 `warm-pragent-cache.yml` 在可信触发器预热（省 ~52s/轮）。缓存键补 `runner.arch`（venv 含编译产物，跨架构命中不可用）；注释标注子目录 checkout 时 `hashFiles` 需改路径。
+- **数值 env 空串静默失效/崩溃（问题三 + 全仓排查）**：`TOUCHSTONE_MAX_DIFF_LINES` 空串此前经 `or 0` 静默关闭 SIZE-001 体量门禁；另有多处裸 `int(env)`/`float(env)` 空串直接 ValueError 崩 job。全仓 14 个文件统一为"空串回落默认"（`_max_diff_lines()` 等），仅显式 `0` 才是关闭。
+- **`TOUCHSTONE_LITELLM_VERBOSE` 空操作（问题二）**：litellm 1.84 的 `set_verbose` 在 import 时求值、事后赋值无效且被废弃。改为显式调 `litellm._turn_on_debug()`；模板默认置 `false` 并注明 stderr 窗口污染（DEBUG 会把 `failure_stderr_tail` 的真实报错挤出）。
+- **耗时可观测性（问题四）**：`_ix` 交互日志每条带 `[+N.NNs]` 相对时间戳；`metrics.build` 增 `durations`（`t_review`/`t_total` 进 `touchstone-metrics.json`，支撑耗时告警）。
+- **预检 ping 开关（问题五）**：`TOUCHSTONE_LLM_PING=false` 可关（默认开，保留防静默故障的观测点）。
+- **Python ≥3.13 下限（问题六）**：`pragent-constraints.txt` 头部显式标注；DEPLOYMENT 新增「部署效率与踩坑」节，把 `TOUCHSTONE_LLM_THINKING`/`REFLECT_MODEL` 升为必配项（集成方数据：213s→31s）。
+- 测试 +5（空串回落 / SIZE 门禁 / ping 开关 / 日志时间戳 / metrics 耗时字段）。
+
 （首个公开发布 [0.1.0] 之后的新变更记于此。）
 
 ## [0.1.0] — 2026-07-18（首个公开发布）
@@ -122,7 +143,7 @@ PR #44/#46 暴露的最后一块拼图：`review_reliable` 信号已接判定层
 - **打包与导入（P1）**：新增 `pyproject.toml`（`pip install -e .` 可装，`touchstone` CLI 入口）；`verify/` 包化；移除全部模块内 `sys.path.insert` hack，包内 sibling 导入统一为 `from touchstone import x`；运行方式统一为 `python -m touchstone.<module>`（workflow/README/RUNBOOK 已同步），`requirements.txt` 降级为指向 pyproject 的薄引用。
 - **仓库卫生（P1）**：移除入库的构建产物——`mutants/`（mutmut 变异快照，约占仓库三分之一体量，其中还残留着已删测试的陈旧副本）与 `.coverage`；`.gitignore` 补全（coverage/pytest/hypothesis/mutants/egg-info/venv/运行产物）。
 - **ghclient「唯一入口」承诺兑现（P1）**：`autonomy` 的 5 处裸 urllib 调用（check_base_fresh / update-branch / GraphQL 入队 / merge 执行 / marker 评论）全部迁至 ghclient——自动合并链路此前无任何重试与 Retry-After 处理；orchestrator 清理 urllib 残留 except 与死导入。
-- **可排障性（P2）**：learning_loop 三处静默吞异常（LLM 调用回退 / 评审线程解析 / diff 取数）补 stderr 留痕；`gitcode_check` 的 `GITCODE_DIFF_CMD` 执行去 `shell=True`（改 shlex.split，管道需求需显式 `bash -c` 包裹，让 shell 语义成为明示选择）。
+- **可排障性（P2）**：learning_loop 三处静默吞异常（LLM 调用回退 / 评审线程解析 / diff 取数）补 stderr 留痕；`gitcode_check` 的 `GITCODE_DIFF_CMD` 执行不再启用 shell（改 shlex.split，管道需求需显式 `bash -c` 包裹，让 shell 语义成为明示选择）。
 
 ### 2026-07-04
 

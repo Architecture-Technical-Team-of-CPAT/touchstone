@@ -137,3 +137,14 @@ python -m touchstone.metrics touchstone-metrics.json
 | 日期 | 变更内容 | 原因 |
 |---|---|---|
 | 2026-07-13 | 首版客户部署指南 | 补齐"交给不懂内情的客户也能稳定跑"的部署路径（区别于 RUNBOOK 作者自测视角），配套 `touchstone doctor` 上线门 |
+
+## 部署效率与踩坑（来自集成方实测的上游报告，2026-07）
+
+一个集成仓的 36 次运行实测：中位 351s → 修复后 117s。差距全部来自配置与上游缺陷，不是 LLM 固有成本。按性价比排序：
+
+1. **缓存必须预热**。GitHub 2026-06-26 起 `pull_request_target` 等低信任触发器对默认分支缓存【只读】——评审工作流里 save 永远失败且被 `continue-on-error` 静默（每轮白重建 venv ~57s）。本仓已改为：`touchstone.yml` 只 restore，`warm-pragent-cache.yml` 在可信触发器（push 到 main / 每周 schedule / 手动）下写缓存。集成方两个工作流都要拿；checkout 到子目录时**两处 `hashFiles` 路径要同步改**，否则该键段静默变空。
+2. **`TOUCHSTONE_LLM_THINKING` 与 `TOUCHSTONE_LLM_REFLECT_MODEL` 是必配项，不是可选调优**。集成方数据：耗时与 diff 行数几乎无关（r=0.288）、与建议条数无关（r=0.065），只随问题难度——reasoning token 是大头。同 PR 实测 thinking 未生效 213s → disabled 31s；整轮 393s → 125s。逐项挑 env 透传（而非整体复制 workflow）时极易漏掉 REFLECT_MODEL。
+3. **数值 env 空串一律回落默认**（`${{ vars.X }}` 未创建时透传空串是常态）。此前 `TOUCHSTONE_MAX_DIFF_LINES` 空串会静默关闭 SIZE-001 体量门禁（超大 PR 直送 LLM 且无提示）；现空串=默认 1000，仅显式 `0` 关闭。全仓数值 env 已统一此语义。
+4. **耗时可观测**：交互日志每条自带 `[+N.NNs]` 相对时间；`touchstone-metrics.json` 增 `t_review` / `t_total`。定位"时间花在哪"不再依赖 GHA 行时间戳。
+5. **诊断开关**：`TOUCHSTONE_LITELLM_VERBOSE=true` 现在真正生效（显式调 `litellm._turn_on_debug()`；litellm 1.84 的 `set_verbose` 在 import 时求值，事后赋值是空操作）。注意 DEBUG 走 stderr、会把失败归因的 600 字符 stderr 窗口挤满——仅临时诊断，用完关闭。`TOUCHSTONE_LLM_PING=false` 可关预检 ping（默认开；fan-out 下省 improve/review 各一次往返，仅在端点已确认健康时关）。
+6. **Python ≥ 3.13 硬下限**：pr-agent 0.39 在 <3.13 与锁文件冲突（`ResolutionImpossible`），且被安装步的 `continue-on-error` 静默成"AI 评审未运行"。锁文件头部已标注。

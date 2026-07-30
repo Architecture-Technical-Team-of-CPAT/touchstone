@@ -23,7 +23,7 @@ jobs:
 
     permissions:
       contents: write        # 写入经验库
-      pull-requests: read    # 读取 PR 数据
+      pull-requests: write   # 开经验库更新 PR（B3）
       issues: read           # 读取评论/审查数据
 
     steps:
@@ -65,6 +65,10 @@ jobs:
           TOUCHSTONE_PROTECTED_TYPES: ${{ vars.TOUCHSTONE_PROTECTED_TYPES || '' }}
           TOUCHSTONE_LEARNING_ENABLED: ${{ vars.TOUCHSTONE_LEARNING_ENABLED || 'true' }}
           TOUCHSTONE_GROUND_TRUTH_MIN: ${{ vars.TOUCHSTONE_GROUND_TRUTH_MIN || '10' }}
+          # c3 rollout 成本控制（缓存 / 预算 / 并发；默认值同设计文档 §5.1，经 vars 可调）
+          TOUCHSTONE_ROLLOUT_CACHE: ${{ vars.TOUCHSTONE_ROLLOUT_CACHE || '' }}       # 空=不缓存；'memory'=进程内；路径=文件缓存
+          TOUCHSTONE_ROLLOUT_BUDGET: ${{ vars.TOUCHSTONE_ROLLOUT_BUDGET || '200' }}   # 每轮总 rollout 上限
+          TOUCHSTONE_ROLLOUT_WORKERS: ${{ vars.TOUCHSTONE_ROLLOUT_WORKERS || '4' }}   # variant 批并发数
           FORCE_REBUILD: ${{ github.event.inputs.force_ground_truth_rebuild || 'false' }}
         run: |
           python -m touchstone.learning_loop \
@@ -74,14 +78,37 @@ jobs:
             --calib-agg calibration.json \
             --output data/learning_report.json
 
-      - name: Commit experience store if changed
+      - name: Push experience update to bot branch + open PR
+        # B3：不再直接 git push origin main（07-13/07-20 两次 non-fast-forward 失败根因）。
+        # 改推滚动分支 + 开 PR；由 bot-pr-merge.yml 在 gate 绿 + 仅 data/*.json + head 匹配触发 run 时合入。
         if: steps.learn.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
         run: |
+          set -u
           git config user.name "Touchstone Bot"
           git config user.email "touchstone-bot@users.noreply.github.com"
+          BOT_BRANCH="bot/experience-update"
+          git checkout -B "$BOT_BRANCH"
           git add data/experience_store.json data/ground_truth.json
-          git commit -m "chore: update experience store + ground truth [skip ci]" || true
-          git push origin main
+          # 不加 [skip ci]：要让 touchstone 评审在此 PR 上跑，gate 绿才触发自动合入
+          git commit -m "chore(bot): weekly experience store + ground truth update" || { echo "无改动"; exit 0; }
+          # 滚动分支：force-push 覆盖上一轮未合残留（learn.yml 有 concurrency 组，无并发）
+          git push -f origin "$BOT_BRANCH"
+          # 带 run id + 时间戳的 title/body，复用时刷新——防 stale 描述被合入（#141 review #4 Stale PR）
+          TITLE="chore(bot): weekly experience store update (run $RUN_ID)"
+          BODY=$(printf '由 learn.yml 定时产出。本轮 run: %s | 时间: %s\n\ngate 绿 + 仅含 data/*.json + head 匹配触发 run 时，由 bot-pr-merge.yml 自动合入（B3）。' "$RUN_ID" "$(date -u +%FT%TZ)")
+          # force-push 后任何残留 open PR 都指向 stale commits，复用有竞态——关旧开新，
+          # 保证 PR metadata 精确反映本轮新提交（#142 review：close stale PRs before creating new）。
+          for n in $(gh pr list --head "$BOT_BRANCH" --base main --state open --json number -q '.[].number' 2>/dev/null || true); do
+            gh pr close "$n" || true
+          done
+          # 开新 PR；真失败则标红（不静默丢——#141 review #3 Race condition）
+          if ! gh pr create --base main --head "$BOT_BRANCH" --title "$TITLE" --body "$BODY"; then
+            echo "::error::gh pr create 失败，本轮经验更新未开出 PR（push 已成功），请人工介入"
+            exit 1
+          fi
 
       - name: Upload learning report
         if: always()

@@ -84,7 +84,8 @@ def render_best_practices(rules, org="Touchstone"):
 
 
 def generate(standards_path, org="Touchstone"):
-    standards = yaml.safe_load(open(standards_path, encoding="utf-8")) or {}
+    with open(standards_path, encoding="utf-8") as f:
+        standards = yaml.safe_load(f) or {}
     return render_best_practices(select_subjective(standards), org)
 
 

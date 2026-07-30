@@ -23,6 +23,7 @@ import yaml
 
 from touchstone import ghclient
 from touchstone.atomicio import atomic_write_json
+from touchstone.artifacts import artifact_path
 
 DEFAULT_GATE = "touchstone/gate"
 _RELAY_OK = {"success", "neutral", "skipped"}
@@ -53,15 +54,16 @@ def load_config(repo_dir):
     path = os.environ.get("TOUCHSTONE_CHECKS",
                           os.path.join(repo_dir, ".touchstone", "checks.yaml"))
     try:
-        data = yaml.safe_load(open(path, encoding="utf-8")) or {}
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
     except FileNotFoundError:
         data = {}                       # 未配置：合法空策略（不挡）
-    except yaml.YAMLError as e:
-        # 文件存在但解析失败 = 配置坏了：不能当成"空策略"静默放行（防静默故障）。
-        # 标 _config_error，post_gate 据此 fail-closed 并在总闸 summary 显式报警。
-        data = {"_config_error": f"checks.yaml 解析失败（{e}）——按 fail-closed 处理，请修正配置"}
-    except OSError:
-        data = {}
+    except (yaml.YAMLError, OSError) as e:
+        # 文件存在但解析失败/不可读（坏 YAML、权限拒、路径指向目录、损坏符号链接等）= 配置坏了：
+        # 不能当成"空策略"静默放行（防静默故障）。标 _config_error，post_gate 据此 fail-closed 并在
+        # 总闸 summary 显式报警。旧 bare `except OSError: data={}` 把这类静默降级成空策略→gate success，
+        # 与 YAMLError 的 fail-closed 处理自相矛盾。FileNotFoundError 在前先捕获，不会落到这里。
+        data = {"_config_error": f"checks.yaml 不可读或解析失败（{e}）——按 fail-closed 处理，请修正配置"}
     data.setdefault("gate", {}).setdefault("status_name", DEFAULT_GATE)
     data.setdefault("checks", [])
     return data
@@ -217,9 +219,15 @@ def _check_verify(pr, cfg):
     """折入 verify 深检结果：verify_change 作为独立/按需 job 跑、写 verify-result.json，
     本插件只把它的结论折进总闸。未跑则记中性（不挡）。"""
     import json
-    path = cfg.get("result_file", "verify-result.json")
+    # 与写出方（verify_change.py:449 artifact_path("verify-result.json")）对齐：设了
+    # TOUCHSTONE_OUTPUT_DIR 时读写都落隔离目录；旧硬编码 "verify-result.json" 只在 CWD 找，
+    # OUTPUT_DIR 非空时读方找不到结果文件、静默记 "verify 未运行" 把 verify 结论漏出总闸
+    # （#90 round-1 finding checks.py:190）。artifact_path 在 OUTPUT_DIR="." 时原样返回文件名，
+    # 默认场景字节级不变；result_file 为绝对路径时 os.path.join 仍尊重之。
+    path = artifact_path(cfg.get("result_file", "verify-result.json"))
     try:
-        d = json.load(open(path, encoding="utf-8"))
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
     except (OSError, ValueError):
         return None, "verify 未运行（无结果文件）"
     if not isinstance(d, dict):
@@ -237,11 +245,13 @@ def _check_verify(pr, cfg):
 
 # ---- CLI：独立发总闸（CI 的 gate job 在 touchstone(+ 可选 verify) 之后聚合并发布）----
 def main():
-    """读 cwd 的 touchstone-findings.json（+ 若 verify 跑过则有 verify-result.json）→ 跑检查
-    → 发对外那【一个】总闸 → 把最终结论写回 touchstone-findings.json（供 autonomy 读到含 verify 的总闸）。"""
+    """读 touchstone-findings.json（+ 若 verify 跑过则有 verify-result.json）→ 跑检查
+    → 发对外那【一个】总闸 → 把最终结论写回 touchstone-findings.json（供 autonomy 读到含 verify 的总闸）。
+    产物路径经 artifact_path 解析：默认 CWD（Action 场景），设 TOUCHSTONE_OUTPUT_DIR 时落隔离目录。"""
     import json
     try:
-        co = json.load(open("touchstone-findings.json", encoding="utf-8"))
+        with open(artifact_path("touchstone-findings.json"), encoding="utf-8") as f:
+            co = json.load(f)
     except (OSError, ValueError):
         # findings 缺失 = touchstone job 没产出结果（崩溃/被取消/artifact 下载失败）。
         # 不能静默 no-op：否则 PR 要么看起来"没事"，要么 required 总闸凭空消失且无说明。
@@ -276,7 +286,7 @@ def main():
     gate, _ = post_gate(pr, cfg, run_checks(cfg, pr))
     co["gate"] = gate
     # 原子：这份含总闸结论的 findings 是 autonomy decide_auto_merge 的直接入参，半文件不可接受
-    atomic_write_json("touchstone-findings.json", co)
+    atomic_write_json(artifact_path("touchstone-findings.json"), co)
     print(f"[gate] 总闸={gate}（已写回 touchstone-findings.json）")
 
 

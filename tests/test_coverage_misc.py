@@ -183,14 +183,33 @@ from touchstone import govern
 
 
 def test_govern_detect_revert_shas_git_failures(monkeypatch):
-    # git log 失败 → 空集
+    # git 不可用 → None（不伪装成空集；熔断据此失败收敛，而非谎报 0 revert/健康=fail-open）
     monkeypatch.setattr(govern.subprocess, "run",
                         lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("no git")))
+    assert govern.detect_revert_shas(".", "main") is None
+
+
+def test_govern_detect_revert_shas_nonzero_exit_is_failure(monkeypatch):
+    # git 非零退出（坏 base ref / 浅克隆缺历史）= 取不到真值 → None（旧实现无 check=True 吞错返空集=fail-open）
+    class _Err:
+        returncode = 1
+        stdout = ""
+    monkeypatch.setattr(govern.subprocess, "run", lambda *a, **k: _Err())
+    assert govern.detect_revert_shas(".", "bad-ref") is None
+
+
+def test_govern_detect_revert_shas_clean_is_empty_set(monkeypatch):
+    # 扫描成功、确无 revert → set()（与"失败→None"严格区分；熔断据此知"测了=0"而非"没测到"）
+    class _R:
+        returncode = 0
+        stdout = "普通提交，无 revert\n"
+    monkeypatch.setattr(govern.subprocess, "run", lambda *a, **k: _R())
     assert govern.detect_revert_shas(".", "main") == set()
 
 
 def test_govern_detect_revert_shas_parses(monkeypatch):
     class _R:
+        returncode = 0
         stdout = ("Merge revert\n\nThis reverts commit abc1234.\n"
                   "This reverts commit deadbeef9.\n")
     monkeypatch.setattr(govern.subprocess, "run", lambda *a, **k: _R())

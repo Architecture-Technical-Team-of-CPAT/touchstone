@@ -253,6 +253,18 @@ def test_load_config_malformed_yaml_is_config_error(tmp_path, monkeypatch):
     assert cfg.get("_config_error")
 
 
+def test_load_config_unreadable_path_is_config_error(tmp_path, monkeypatch):
+    # 路径存在但不可读（指向目录→IsADirectoryError；权限拒→PermissionError；均 OSError 子类、
+    # 非 FileNotFoundError）= 配置坏了，须 fail-closed（与坏 YAML 同语义），不能映射成空策略静默放行。
+    # 旧 bare `except OSError: data={}` 把这类降级成空策略 → aggregate_gate([]) → gate "success"
+    # （与 YAMLError 的 fail-closed 自相矛盾）。本测锁死修复。
+    d = tmp_path / "checks.yaml"
+    d.mkdir()                       # TOUCHSTONE_CHECKS 指向目录 → open() 抛 IsADirectoryError(OSError)
+    monkeypatch.setenv("TOUCHSTONE_CHECKS", str(d))
+    cfg = checks.load_config(str(tmp_path))
+    assert cfg.get("_config_error"), "不可读 checks.yaml 应标 _config_error（fail-closed），非空策略"
+
+
 def test_post_gate_config_error_fails_closed(monkeypatch):
     posted = {}
     monkeypatch.setattr(checks.ghclient, "request",

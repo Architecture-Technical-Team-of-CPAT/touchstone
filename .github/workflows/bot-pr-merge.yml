@@ -1,0 +1,54 @@
+# B3：经验库更新走 PR；本工作流仅在【bot 分支上触发的 Touchstone 评审】完成且 gate 绿、
+# 改动仅限 data/experience_store.json / data/ground_truth.json、且 PR head 等于触发 run 的 head 时合入。
+# 三道闸：① head_branch——只处理 bot/experience-update 的运行（避免跨 PR 触发，#141 review #1/#5）；
+#         ② 内容——只合两个数据文件；③ 新鲜度——PR head 须等于触发 run 的 head_sha（防 stale 合入，#141 review #4）。
+# PR 号优先取 workflow_run payload（精确，#141 review #2），偶发为空再回落 gh pr list。
+name: Auto-merge bot experience PR
+
+on:
+  workflow_run:
+    workflows: ["Touchstone"]
+    types: [completed]
+
+concurrency:
+  group: bot-pr-merge
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    # 仅处理来自 bot 分支、且整体 success 的 Touchstone 运行（⟺ gate 等 job 全过）
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'bot/experience-update' }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          # 优先用 workflow_run payload 的 PR 号（精确指向触发本次运行的那个 PR）；payload 偶发为空则回落
+          NUM="${{ github.event.workflow_run.pull_requests[0].number }}"
+          if [ -z "${NUM:-}" ]; then
+            NUM=$(gh pr list --head bot/experience-update --base main --state open --json number -q '.[0].number' 2>/dev/null || true)
+          fi
+          if [ -z "${NUM:-}" ]; then echo "no open bot/experience-update PR, skip"; exit 0; fi
+          # 新鲜度闸（fail-closed）：PR head 必须等于触发本次 workflow_run 的 head_sha。
+          # 取不到 PR head（API 失败/返回空）= 无法验证新鲜度 → exit 1 拒绝合入（红、可见），
+          # 绝不静默绕过（#142 review：freshness gate bypassing on API failure）。
+          TRIG_SHA="${{ github.event.workflow_run.head_sha }}"
+          if ! PR_HEAD=$(gh pr view "$NUM" --json headRefOid -q .headRefOid 2>/dev/null) || [ -z "${PR_HEAD:-}" ]; then
+            echo "::error::无法获取 PR #$NUM 的 head（API 失败或返回空），不能验证新鲜度，fail-closed 拒绝合入"; exit 1
+          fi
+          if [ "$PR_HEAD" != "$TRIG_SHA" ]; then
+            echo "PR #$NUM head ($PR_HEAD) ≠ 触发 run head ($TRIG_SHA)，stale，跳过"; exit 0
+          fi
+          # 内容闸：只允许改动这两个数据文件；出现任何其它路径 → 拒绝合入
+          FILES=$(gh pr diff "$NUM" --name-only)
+          BAD=$(echo "$FILES" | grep -vE '^data/(experience_store|ground_truth)\.json$' || true)
+          if [ -n "$BAD" ]; then
+            echo "PR #$NUM 含非数据文件改动，拒绝自动合入："; echo "$BAD"; exit 1
+          fi
+          echo "PR #$NUM 仅含数据文件，head 匹配触发 run，Touchstone gate 绿，合入"
+          gh pr merge "$NUM" --squash --delete-branch
