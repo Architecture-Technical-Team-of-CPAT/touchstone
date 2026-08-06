@@ -5,9 +5,34 @@
 
 ## [未发布]
 
-### Probe：测试有效性探针（新模块）
+（下个版本的新变更记于此。）
 
-补上 Touchstone 缺失的「测试相对于行为」审查层——回答「『测试全绿』本身可信吗」。对标 dev-loop 变异探针实践与 AKDI fail-open 实证（lint 零文件检查恒 exit 0、冒烟 11/63 skip 计通过）。设计见 `docs/touchstone-probe-design.md`（随 docs/probe-design 分支独立 PR 交付，SIZE-001 拆分）。
+## [0.2.1] — 2026-08-06（从 AKDI-SE/touchstone 同步 TF-GRPO 生产化全部差距）
+
+本版本从 AKDI-SE/touchstone main（`3e83d3c`）同步 65 个 commit，含 TF-GRPO 离线自演化生产化的全部 4 个差距。4 个差距遵循同一纪律：**env-default-off = 字节级零行为变化**，纯函数 + 离线可测，无 layer-contract 变更。
+
+### TF-GRPO 生产化差距（3a + 1a + 3b + 2a，皆 opt-in、默认零行为变化）
+
+- **差距 3a 收敛检测 + 增量水位**（AKDI-SE #151）：连续 `N_STABLE` 轮 text+lift 不变的 active 经验标 `stable`，下轮蒸馏跳过该 type（省 LLM 调用）；增量水位（`TOUCHSTONE_INCREMENTAL`）只取 number>水位的新 PR，每 `FULL_REFRESH_EVERY` 轮强制全量对账兜底漂移。
+- **差距 1a 位置级奖励 env 接通**（AKDI-SE #152）：thread_findings 带 file/line → `build_ground_truth` 产 resolved_findings → `make_gt_entry` 产 `human_adopted_positions` → `score_review` 走位置级部分信用。机制 + 数据管线 + 测试就位，本 env 接通生产 run-path（`TOUCHSTONE_POSITIONAL_REWARD`）。
+- **差距 3b 差分时序 + 趋势回滚**（AKDI-SE #153，merge `4cdfd42`）：开 `TOUCHSTONE_DIFFERENTIAL_METRICS=true` 后每轮 per-type lift 追加到 `adoption-trend.json`（时序可观测）；active 经验 lift 连续 `AUTO_ROLLBACK_M` 轮下降 → 趋势退役（与 `retire_on_negative_lift` 静态阈值互补，提前下线慢性恶化经验）。
+- **差距 2a 跨 PR 一致性过滤**（AKDI-SE #154，merge `3e83d3c`）：candidate 入池前要求来自 ≥`MIN_SOURCE_PRS` 个 PR 且跨 PR reward 方差 ≤`MAX_REWARD_VAR`（防"仅 1 PR 高 reward"的运气型 outlier 污染经验库）。默认 MIN=1（不限）、MAX_VAR 空（不检查）= 不过滤。
+
+### 其他同步内容（AKDI-SE 侧既有的 TF-GRPO 闭环 + 经验库改进）
+
+- **TF-GRPO 闭环合上**（AKDI-SE #143）：开 shadow 注入 + 接通 taxonomy 清洗开关（`TOUCHSTONE_TAXONOMY_ENFORCE`）。
+- **finding_type 归一化**（AKDI-SE #144）：合并大小写/分隔符变体（不丢弃），稳定 tiebreak + 兄弟 evidence 合并。
+- **waived 噪声标签采集**（AKDI-SE #146）：采集 waived+merged 为确认噪声标签（Phase 1，零行为变化）。
+- **marker 信任根收紧**（AKDI-SE #147）：`bot_login` 已知时精确匹配（系统级安全加固）。
+- **聚合单侧失败轮数**（AKDI-SE #148）：run-285 盲区——improve 挂而 review 仍可信时不再隐身。
+- **CI 耗时优化**（AKDI-SE #149）：内联 gate + pip 下载缓存 + 文档化 verify-result.json 缺失一致性。
+- **经验库数据更新**：weekly experience store + ground truth update（bot 自动产出）。
+
+### 探针与运维加固（从 AKDI-SE [未发布] 节迁入）
+
+#### Probe：测试有效性探针（新模块）
+
+补上 Touchstone 缺失的「测试相对于行为」审查层——回答「『测试全绿』本身可信吗」。对标 dev-loop 变异探针实践与 AKDI fail-open 实证（lint 零文件检查恒 exit 0、冒烟 11/63 skip 计通过）。设计见 `docs/touchstone-probe-design.md`。
 
 - **L0 断言普查（静态·`census`）**：不跑测试，静态揪四类假测试——skip 计通过 / 零断言 / 恒真弱断言（assert True、assertIsNotNone）/ 吞异常。
 - **L1 变异探针（动态·`plan`+`run`）**：锚定 ScopeFacts 增量函数，按（分支数 × 低断言密度）选点，套最小高价值算子集（CMP/BOOL/CONST/RET/EXC，纯 stdlib `ast`，零第三方），预算内注入→定向跑测→恢复源码→五态判决。
@@ -16,17 +41,15 @@
 - 边界：增量抽样非全库、不替代测试运行器、不自动改测试；等价变异体走 ack 人裁；Go 引擎/全库基线棘轮留待 M2。
 - 新增 `touchstone/probe.py`（~350 行）+ 13 测试（静态快测 + 真跑 pytest 的 run/replay 端到端）。
 
-### 运维加固（集成方 CI 耗时上游报告，中位 351s→117s 的经验固化）
+#### 运维加固（集成方 CI 耗时上游报告，中位 351s→117s 的经验固化）
 
-- **缓存写入（问题一，影响所有模板集成方）**：GitHub 2026-06-26 起 `pull_request_target` 对默认分支缓存只读，save 永久失败且被 `continue-on-error` 静默为黄警告（"针对瞬态故障的容错在故障变永久后成为静默器"）。`touchstone.yml` 改 restore-only、权限降 `actions: read`；新增 `warm-pragent-cache.yml` 在可信触发器预热（省 ~52s/轮）。缓存键补 `runner.arch`（venv 含编译产物，跨架构命中不可用）；注释标注子目录 checkout 时 `hashFiles` 需改路径。
-- **数值 env 空串静默失效/崩溃（问题三 + 全仓排查）**：`TOUCHSTONE_MAX_DIFF_LINES` 空串此前经 `or 0` 静默关闭 SIZE-001 体量门禁；另有多处裸 `int(env)`/`float(env)` 空串直接 ValueError 崩 job。全仓 14 个文件统一为"空串回落默认"（`_max_diff_lines()` 等），仅显式 `0` 才是关闭。
-- **`TOUCHSTONE_LITELLM_VERBOSE` 空操作（问题二）**：litellm 1.84 的 `set_verbose` 在 import 时求值、事后赋值无效且被废弃。改为显式调 `litellm._turn_on_debug()`；模板默认置 `false` 并注明 stderr 窗口污染（DEBUG 会把 `failure_stderr_tail` 的真实报错挤出）。
-- **耗时可观测性（问题四）**：`_ix` 交互日志每条带 `[+N.NNs]` 相对时间戳；`metrics.build` 增 `durations`（`t_review`/`t_total` 进 `touchstone-metrics.json`，支撑耗时告警）。
-- **预检 ping 开关（问题五）**：`TOUCHSTONE_LLM_PING=false` 可关（默认开，保留防静默故障的观测点）。
-- **Python ≥3.13 下限（问题六）**：`pragent-constraints.txt` 头部显式标注；DEPLOYMENT 新增「部署效率与踩坑」节，把 `TOUCHSTONE_LLM_THINKING`/`REFLECT_MODEL` 升为必配项（集成方数据：213s→31s）。
-- 测试 +5（空串回落 / SIZE 门禁 / ping 开关 / 日志时间戳 / metrics 耗时字段）。
-
-（首个公开发布 [0.1.0] 之后的新变更记于此。）
+- **缓存写入（问题一，影响所有模板集成方）**：GitHub 2026-06-26 起 `pull_request_target` 对默认分支缓存只读，save 永久失败且被 `continue-on-error` 静默为黄警告。`touchstone.yml` 改 restore-only、权限降 `actions: read`；新增 `warm-pragent-cache.yml` 在可信触发器预热（省 ~52s/轮）。缓存键补 `runner.arch`；注释标注子目录 checkout 时 `hashFiles` 需改路径。
+- **数值 env 空串静默失效/崩溃（问题三 + 全仓排查）**：全仓 14 个文件统一为"空串回落默认"，仅显式 `0` 才是关闭。
+- **`TOUCHSTONE_LITELLM_VERBOSE` 空操作（问题二）**：改为显式调 `litellm._turn_on_debug()`；模板默认置 `false` 并注明 stderr 窗口污染。
+- **耗时可观测性（问题四）**：`_ix` 交互日志每条带 `[+N.NNs]` 相对时间戳；`metrics.build` 增 `durations`。
+- **预检 ping 开关（问题五）**：`TOUCHSTONE_LLM_PING=false` 可关。
+- **Python ≥3.13 下限（问题六）**：`pragent-constraints.txt` 头部显式标注。
+- 测试 +5。
 
 ## [0.1.0] — 2026-07-18（首个公开发布）
 
