@@ -74,6 +74,7 @@ def test_summarize_rates():
     assert s["silent_failure_rounds"] == 1
     assert s["blocked_by_unverified_claims"] == 1
     assert s["engine_status_dist"] == {"ok": 3}
+    assert s["improve_degraded_rounds"] == 0 and s["review_degraded_rounds"] == 0
 
 
 def test_summarize_detected_failure_is_not_silent():
@@ -99,6 +100,25 @@ def test_summarize_empty():
     assert s["converged_rate"] == 0.0
     assert s["blocked_by_unverified_claims"] == 0
     assert s["engine_status_dist"] == {}
+    assert s["improve_degraded_rounds"] == 0 and s["review_degraded_rounds"] == 0
+
+
+def test_summarize_partial_tool_failure_counts():
+    """单侧失败（fan-out 下 improve 挂、review 仍可信）既不算 silent（engine_status=='ok'）也不进
+    engine_status_dist 的 llm_failed（那是"全部工具都挂"）——没有专属计数时，"improve 连挂数日、
+    review 正常"会在聚合趋势里隐身（可信率仍高、引擎分布显示 ok），正是 run-285 那种盲区。锁死聚合计数。"""
+    def _partial(side):
+        r = _rec(reliable=True, engine="ok", ai=2)   # review 仍可信、engine ok
+        r["partial_tool_failure"] = side
+        return r
+    recs = [_partial("improve"), _partial("improve"), _partial("review"),
+            _rec(reliable=True, engine="ok", ai=2)]   # 无单侧失败
+    s = M.summarize(recs)
+    assert s["improve_degraded_rounds"] == 2
+    assert s["review_degraded_rounds"] == 1
+    # 单侧失败既不计入 silent、也不是全降级——engine_status_dist 仍是 ok
+    assert s["silent_failure_rounds"] == 0
+    assert s["engine_status_dist"] == {"ok": 4}
 
 
 def test_build_carries_round_no():

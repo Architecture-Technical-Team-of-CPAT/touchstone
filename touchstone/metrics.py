@@ -131,6 +131,12 @@ def summarize(records):
     for r in records:
         k = r.get("engine_status", "unknown")
         engine_dist[k] = engine_dist.get(k, 0) + 1
+    # 单侧失败轮数（fan-out 下 improve/review 之一挂、另一侧仍可信）：
+    # 这类 partial 失败既不算 silent（engine_status=='ok'）也不进 engine_status_dist 的 llm_failed
+    # （那是"全部已跑工具都挂"）——没有专属计数时，"improve 连挂数日、review 正常"会在聚合趋势里隐身
+    # （review_reliable_rate 仍高、engine_status_dist 显示 ok），正是 run-285 那种盲区。故单列计数。
+    improve_degraded = sum(1 for r in records if r.get("partial_tool_failure") == "improve")
+    review_degraded = sum(1 for r in records if r.get("partial_tool_failure") == "review")
     return {
         "rounds": n,
         "review_reliable_rate": round(reliable / n, 3) if n else 0.0,   # 越高越好；< 0.8 值得排查
@@ -138,6 +144,8 @@ def summarize(records):
         "converged_rate": round(converged / n, 3) if n else 0.0,
         "blocked_by_unverified_claims": blocked_by_claims,   # 被 author 自证闸拦下的轮数
         "engine_status_dist": engine_dist,                   # 引擎状态分布（诊断入口）
+        "improve_degraded_rounds": improve_degraded,         # improve 单侧失败轮（review 仍可信）
+        "review_degraded_rounds": review_degraded,           # review 单侧失败轮（improve 仍可信）
     }
 
 
