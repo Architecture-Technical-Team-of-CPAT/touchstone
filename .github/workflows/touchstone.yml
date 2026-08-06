@@ -50,27 +50,37 @@ jobs:
         id: py
         with:
           # 钉 3.13：pr-agent 的原生依赖（tiktoken 经 PyO3 0.22.6）暂不支持 3.14，会源码编译失败。
-          # 且必须与 warm-pragent-cache.yml 钉同一版本——缓存键含解析出的补丁号，任一侧漂移即全员 cache miss。
+          # 且必须与 warm-pragent-cache.yml 钉同一版本——两工作流的 venv 缓存键须逐字段一致（见下方 key）。
           python-version: "3.13"
+          # pip 下载缓存（~/.cache/pip）：键由 setup-python 按 pyproject.toml/requirements.txt 哈希自动算。
+          # 一处生效帮两处：(1) 下方 pip install -e . 命中本地 wheel 免下载（10s→~3s，并消除网络抖动尾部）；
+          # (2) venv 缓存 miss 时 .pragent-venv/bin/pip install pr-agent 复用同一下载缓存（~60s→~35s）。
+          # warm-pragent-cache.yml 也开了 cache: pip → warm 跑过的 wheel 进默认分支缓存、PR 侧 restore 即用。
+          cache: pip
+      - name: Resolve Python minor (venv cache key stability)
+        id: pyminor
+        # 缓存键只用 minor（3.13）不用补丁号（3.13.14）：同 minor 的 cp313 ABI 稳定，编译 wheel
+        # （tiktoken/tokenizers 等）跨补丁号可复用——避免 runner 镜像升补丁号时全员 miss + 重建波
+        # （warm 的 schedule 是周一，否则升补丁到下周一之间每个 PR 白重建 ~35s）。import pr_agent 兜底
+        # 检查防任何罕见 ABI 问题（失败即下方 Set up 步重建），正确性不失。键段须与 warm 逐字一致。
+        run: echo "minor=$(echo '${{ steps.py.outputs.python-version }}' | cut -d. -f1,2)" >> "$GITHUB_OUTPUT"
       - name: Install deps
         run: pip install -e .
         # 自托管 runner 若经代理访问公网：按需设置/清理 *_PROXY；可选用私有/就近 PyPI 镜像加速 pip install
       - name: Restore PR-Agent venv (cache)
         # 缓存装好的 .pragent-venv（pr-agent + 130+ 依赖），省掉每次 ~64s 的 venv 创建 + pip install
         # （实测每轮 GHA 日志：venv 步骤稳定 ~64s，是 LLM 调用之外最大固定开销）。
-        # 键含 OS + Python【补丁号】(steps.py.outputs.python-version，如 3.13.14) + pr-agent 版本：
-        # 解释器补丁升级 / OS / pr-agent 版本任一变即 miss→重建并重新持久化（自愈）。
-        # 拆 restore/save（闭环 round-5 finding「Persist cache even when job fails downstream」）：
-        # 本步只 restore（命中即复用）；save 下移到独立步、if: success()——仅整条 touchstone job 成功
-        # （含 Run review）才持久化，避免从失败 run 把状态写进缓存。降级轮 job 仍判 success
-        # （orchestrator 优雅降级 exit 0，已实证 run 29463635695），故不损命中率；只真崩溃才跳 save（正是期望）。
-        # 边界：save 仍仅在【miss】时写回——key 匹配但内容失效（罕见镜像内部变更未带补丁号变）时不自动刷新，
-        # 靠下方 import 兜底检查【每轮】重建保证可用（正确性不失）；要永久刷新该条目需手动 bump key 后缀（-v1→-v2）。
+        # 键含 OS + arch + Python【minor】(steps.pyminor.outputs.minor，如 3.13) + pr-agent 版本 + 锁哈希：
+        #   - minor 而非补丁号：同 minor 的 cp313 ABI 稳定，编译 wheel 跨补丁号可复用——runner 镜像升补丁号
+        #     不再致全员 miss（旧键含补丁号时，升补丁→下个周一 warm 之间每 PR 白重建 ~35s）。
+        #   - 罕见 ABI 漂移由下方 Set up 步的 import pr_agent 兜底（失败即重建），正确性不失。
+        # 本工作流只 restore（pull_request_target 属低信任触发器，GitHub 2026-06-26 起对默认分支缓存只读，
+        # save 永久失败）；save 由 warm-pragent-cache.yml 在可信触发器（push/schedule/workflow_dispatch）下做。
         id: pragent-venv
         uses: actions/cache/restore@v4
         with:
           path: .pragent-venv
-          key: pragent-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.py.outputs.python-version }}-pragent${{ env.PRA_VERSION }}-lock${{ hashFiles('pragent-constraints.txt') }}-v1
+          key: pragent-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.pyminor.outputs.minor }}-pragent${{ env.PRA_VERSION }}-lock${{ hashFiles('pragent-constraints.txt') }}-v2
           # 键含 runner.arch：runner.os 对 x64/arm64 同为 Linux，venv 带编译产物（tiktoken 等），跨架构命中不可用。
           # 集成方注意：hashFiles 相对 workspace 根解析——若把 touchstone checkout 到子目录，请按实际路径调整
           # （如 hashFiles('.touchstone-src/pragent-constraints.txt')），否则该段静默变空、锁文件变更不再使缓存失效。
@@ -157,6 +167,27 @@ jobs:
           TOUCHSTONE_EXPERIENCE: "data/experience_store.json"
           TOUCHSTONE_EXPERIENCE_ENABLED: "true"
           TOUCHSTONE_EXPERIENCE_REF: "origin/${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}"  # 从受信 base ref 读经验库（防 PR 篡改工作树投毒）         # 评审路径注入开关（review_provider._experience_injection 认）
+          # ── shadow 注入（冷启动破死锁：让 candidate 采 A/B with-臂数据 → graduate→active）──
+          # 触发背景：run #6（07-27）TF-GRPO 蒸出 191 条 candidate，但全是 candidate、0 条 active，
+          # 而 render_injection 默认只注入 active → 评审侧 0 条经验、闭环没合上。开 shadow 注入让
+          # candidate 以 advisory（标灰 [shadow]、不进闸）进入评审、同时 marker 归因 shadow_types，
+          # 才能采集 lift 数据、逐步 graduate 达标转 active。
+          # 安全前提已满足：① step4 已接通——review_provider._experience_injection 与 orchestrator
+          #   _collect_injection 读【同一】_shadow_injection_enabled()，marker 归因与实际渲染同源，
+          #   不会失真（experience_store.py 早期"未接通 step4 勿开"警告现已过时）；② EXPERIENCE_REF
+          #   已配 → candidate 也走受信 ref（铁律 5，review_provider.py L473-480 已拦）。
+          TOUCHSTONE_SHADOW_INJECTION: ${{ vars.TOUCHSTONE_SHADOW_INJECTION || 'true' }}
+          # vars. kill-switch（对齐文件既有 vars.X||default 约定，如 TOUCHSTONE_LEARNING_ENABLED）：
+          # 默认 'true'（冷启动需采 A/B 数据、闭环要合上）；运维发现 shadow 注入扰乱归因、或候选池已普遍
+          # active 不再需要采数时，置 repo variable TOUCHSTONE_SHADOW_INJECTION=false 即可零代码关闭（fail-safe）。
+          # GHA 表达式里非空串 "false" 为真值 → 原样透传 "false" → Python 侧 _shadow_injection_enabled() 判关。
+          # min_evidence=2（默认 1）：只 shadow 注入 source_prs≥2 的 candidate。当前池里有 150/191 条
+          # 是单 PR 孤证（含 LLM 幻觉型 PRA-A/B/C/OK 等，均 source_prs=['116']），min_evidence=2 把这些
+          # 孤证噪声挡在 shadow 外，只放 41 条有重复证据的进采数臂——降爆面、又不饿死臂（真规律会在
+          # 后续 PR 复现、被再蒸馏补证据后入选）。ratio/max 仍走设计默认（0.5 / 3 每轮）。
+          # 经 vars. 可调（对齐 TOUCHSTONE_SHADOW_INJECTION 的 kill-switch 约定）：池子变干净后可下调到 1
+          # 扩大采数面，或上调进一步收窄。默认 '2'。
+          TOUCHSTONE_SHADOW_MIN_EVIDENCE: ${{ vars.TOUCHSTONE_SHADOW_MIN_EVIDENCE || '2' }}
           # 评审健康度看板（可选，默认关）：置 true 后，每轮在本仓开/重写一个带 label 的 issue
           # 成"活"看板（本轮快照 + 滚动趋势；body 重写不发通知，仅显著事件追加评论）。
           # 经 repo variable 配（Settings → Secrets and variables → Actions → Variables，
@@ -192,6 +223,28 @@ jobs:
           name: touchstone-metrics
           path: touchstone-metrics.json
           if-no-files-found: ignore
+      # P1⑥（端到端耗时治理）：默认路径（verify+autonomy 都关）下把 gate 内联进本 job，省掉
+      # 整条 gate job（checkout + setup-python + pip install -e . + download-artifact + 再 upload）
+      # 的串行开销——36 run 实测默认路径占 100%（verify/auto_merge 全 skipped），gate job 恒跑却
+      # 只做"读本地 findings → 发一个 check"。本步与 gate job 互斥（下方 gate.if 收紧为
+      # verify‖autonomy 才跑），保证【对外仍只发一个总闸】不变式。互斥由 if 条件保证：
+      #   本步 = `!V && !A`（De Morgan），gate job = `V || A`——两者必有一个为假、不会双发闸。
+      # findings.json 已由 Run review 写在 cwd；checks.py 缺失时据 TOUCHSTONE_HEAD_SHA 发
+      # "未产出结果" failure check（与 gate job 行为逐字一致）。verify-result.json 在默认路径
+      # （verify 关）从不产出：checks._check_verify 的 `except (OSError, ValueError)` 把"文件
+      # 不存在"（本步）与"artifact 下载 continue-on-error 静默失败"（gate job）归一为同一中性
+      # 结论 → 两路逐字一致。verify/autonomy 任一开则本步跳过、仍由独立 gate job 聚合 verify
+      # 结果发闸——凭据隔离设计（§6.6）零变化。
+      # `!cancelled()`：与 gate job 的 `if: !cancelled() && ...` 对齐——被取消时不发 check
+      # （否则 `always()` 含取消态、会对每个被取消的 run 发"未产出结果" failure check，偏离旧行为）。
+      - name: "Post gate (default path: verify + autonomy off)"
+        if: ${{ always() && !cancelled() && vars.VERIFY_ENABLED != 'true' && vars.AUTONOMY_ENABLED != 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TOUCHSTONE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO_DIR: "."
+        run: python -m touchstone.checks
 
   # ---- 可选深检：verify（默认关；vars.VERIFY_ENABLED=='true' 且风险分流判为需验证时才跑）----
   # 凭据隔离（设计 §6.6 的落地）：verify 拆成两个 job——
@@ -216,6 +269,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip       # 复用 touchstone job / warm 预热的 pip 下载缓存，省 pip install -e . 的下载
       - name: Install deps
         run: pip install -e .
       - name: plan（持密；不执行 PR 代码）
@@ -250,6 +304,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip       # 复用 touchstone job / warm 预热的 pip 下载缓存，省 pip install -e . 的下载
       - name: Install deps
         run: pip install -e .
       - uses: actions/download-artifact@v4
@@ -272,9 +327,15 @@ jobs:
 
   # ---- 质量门禁：聚合 touchstone 规则 + 转达检查 +（若跑过）verify → 对外发【一个】总闸 ----
   # needs verify_execute 但用 !cancelled() 兜底：verify 链被跳过（默认）时本 job 仍运行，verify 插件记中性、不挡。
+  # P1⑥：默认路径（verify+autonomy 都关）下总闸已由 touchstone job 的 "Post gate" 步内联发出，
+  # 本 job 收紧为【仅在 verify‖autonomy 开启时】才跑——否则与 touchstone 内联步互发两个总闸。
+  # 默认路径占绝大多数（36 run 实测 100% verify/auto_merge 全 skipped），跳过本 job 省一整条
+  # 串行 job（checkout + setup-python + pip install + artifact I/O，约 18–28s/轮 + job 间排队）。
+  # verify 开：本 job 聚合 verify-result 发闸（凭据隔离不变）；autonomy 开：auto_merge 需本 job
+  # re-upload 的含总闸 findings（下方 Re-upload 步），故 autonomy 开时也须经此路径。
   gate:
     needs: [touchstone, verify_execute]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (vars.VERIFY_ENABLED == 'true' || vars.AUTONOMY_ENABLED == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -287,6 +348,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip       # 复用 touchstone job / warm 预热的 pip 下载缓存，省 pip install -e . 的下载
       - run: pip install -e .
       - name: Download touchstone (+ verify if ran) outputs
         uses: actions/download-artifact@v4
@@ -322,7 +384,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.ref }}
       - uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
+        with: { python-version: "3.13", cache: pip }
       - run: pip install -e .
       - name: Download touchstone findings (final, gate-updated)
         uses: actions/download-artifact@v4

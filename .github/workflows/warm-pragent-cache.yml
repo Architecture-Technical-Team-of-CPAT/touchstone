@@ -19,7 +19,7 @@ on:
       - .github/workflows/warm-pragent-cache.yml
       - .github/workflows/touchstone.yml
   schedule:
-    - cron: "17 3 * * 1"     # 每周一预热一次：兜底 runner 镜像更新导致的 Python 补丁号变化（键含补丁号）
+    - cron: "17 3 * * 1"     # 每周一预热一次：兜底缓存 7 天未访问过期，以及 runner 镜像/依赖漂移
   workflow_dispatch: {}
 
 permissions:
@@ -37,14 +37,21 @@ jobs:
       - uses: actions/setup-python@v5
         id: py
         with:
-          python-version: "3.13"   # 评审意见：两个工作流必须钉同一版本——缓存键含解析出的补丁号，
-                                   # 任一侧漂移即全员 cache miss；且 pragent-constraints 硬下限即 3.13
+          python-version: "3.13"   # 评审意见：两个工作流必须钉同一版本——缓存键含 minor，任一侧漂移即全员 miss；
+                                   # 且 pragent-constraints 硬下限即 3.13
+          cache: pip       # warm 也开：warm 跑过的 pr-agent wheel 进默认分支 pip 缓存，
+                           # PR 侧 touchstone.yml 的 pip install -e . 与 venv 重建都直接复用（免下载）
+      - name: Resolve Python minor (venv cache key stability)
+        id: pyminor
+        # 与 touchstone.yml 逐字一致：键只用 minor（3.13）不用补丁号——同 minor cp313 ABI 稳定，
+        # 编译 wheel 跨补丁号可复用，runner 镜像升补丁号不再致缓存全失效。PR 侧 import 兜底防罕见 ABI 漂移。
+        run: echo "minor=$(echo '${{ steps.py.outputs.python-version }}' | cut -d. -f1,2)" >> "$GITHUB_OUTPUT"
       - name: Restore (skip rebuild on hit)
         id: pv
         uses: actions/cache/restore@v4
         with:
           path: .pragent-venv
-          key: pragent-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.py.outputs.python-version }}-pragent${{ env.PRA_VERSION }}-lock${{ hashFiles('pragent-constraints.txt') }}-v1
+          key: pragent-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.pyminor.outputs.minor }}-pragent${{ env.PRA_VERSION }}-lock${{ hashFiles('pragent-constraints.txt') }}-v2
       - name: Build venv (same guarded steps as touchstone.yml)
         if: steps.pv.outputs.cache-hit != 'true'
         run: |
@@ -63,4 +70,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .pragent-venv
-          key: pragent-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.py.outputs.python-version }}-pragent${{ env.PRA_VERSION }}-lock${{ hashFiles('pragent-constraints.txt') }}-v1
+          key: pragent-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.pyminor.outputs.minor }}-pragent${{ env.PRA_VERSION }}-lock${{ hashFiles('pragent-constraints.txt') }}-v2

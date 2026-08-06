@@ -25,17 +25,62 @@ from touchstone.experience_store import (_exp_id, _is_review_type,           # n
 # --- 阈值 ---------------------------------------------------------------------
 DISTILL_MIN_FIRES   = 8      # 命中样本下限，才考虑蒸馏成候选经验
 
+# 差距2a：跨 PR 一致性（opt-in，默认关 = 零行为变化）
+#   仅 1 PR 高 reward 的 candidate 是"运气"非"能力"——入池前要求 source_prs ≥ K 且 reward_var 小。
+#   默认 K=1（=不限=现状）、max_var 未设（=不检查）；开启需 vars 显式设更紧值。
+DISTILL_MIN_SOURCE_PRS_DEFAULT = 1     # 1 = 不限（每条 candidate 至少来自 1 PR，恒满足）
+
+
+def _distill_min_source_prs():
+    """TOUCHSTONE_DISTILL_MIN_SOURCE_PRS：candidate 至少来自 N 个 PR 才入池（默认 1=不限=现状）。"""
+    try:
+        # int(float(...)) 兜底 "2.0" 等合法 float 串——int("2.0") 抛 ValueError 会静默退默认值
+        # （PRA round-4 distill.py:34），让 TOUCHSTONE_DISTILL_MIN_SOURCE_PRS=2.0 悄悄变 1 难排查。
+        n = int(float((os.environ.get("TOUCHSTONE_DISTILL_MIN_SOURCE_PRS") or "").strip()
+               or str(DISTILL_MIN_SOURCE_PRS_DEFAULT)))
+    except (ValueError, TypeError):
+        n = DISTILL_MIN_SOURCE_PRS_DEFAULT
+    return n if n > 0 else DISTILL_MIN_SOURCE_PRS_DEFAULT
+
+
+def _distill_max_reward_var():
+    """TOUCHSTONE_DISTILL_MAX_REWARD_VAR：跨 PR reward 方差上限（默认未设=不检查）。
+    非负 float 启用；空/非法/负 → None（不检查）。设计推荐 0.15。"""
+    v = (os.environ.get("TOUCHSTONE_DISTILL_MAX_REWARD_VAR") or "").strip()
+    if not v:
+        return None
+    try:
+        f = float(v)
+    except ValueError:
+        return None
+    return f if f >= 0 else None
+
+
+def _pvariance(values):
+    """总体方差（纯函数）。n<2 返回 0.0——单点方差定义性为 0（恒 ≤ max_var → pass），并非"无意义"：
+    单 PR 候选的样本量把关由 min_source_prs 闸负责（正交职责），方差闸只度量既有 ≥2 PR 的一致性
+    （PRA round-4 distill.py:57）。避免顶层 import statistics（仅此处用）。"""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    return sum((x - mean) ** 2 for x in values) / n
+
 # --- 蒸馏：calibrate 奖励 → 候选经验（训练-free 计数式）--------------------------
-def distill_candidates(calib_agg, repo="", stack=""):
+def distill_candidates(calib_agg, repo="", stack="", skip_types=None):
     """从 calibrate.aggregate 的 by_rule 统计蒸馏候选经验（无 LLM、无权重）。
     低采纳→suppress（别挑）、高采纳→emphasize（该挑）。只对 PR-Agent 源类型；确定性 contract 类型被跳过。
-    更丰富的 TF-GRPO 语义优势蒸馏见 _distill_via_llm（已实现，需旗舰模型端点）。"""
+    更丰富的 TF-GRPO 语义优势蒸馏见 _distill_via_llm（已实现，需旗舰模型端点）。
+    skip_types（差距3a）：已收敛稳定的 type 集合，跳过其候选产出（active 已稳定，不必反复改写）。"""
     now = int(time.time())
     protected = _protected_types()
+    skip_types = skip_types or set()
     out = []
     for ftype, v in (calib_agg.get("by_rule") or {}).items():
         if not _is_review_type(ftype):
             continue                      # 确定性 contract 类型不进经验（固定基准）
+        if ftype in skip_types:
+            continue                      # 收敛稳定：跳过（省候选产出；active 不变）
         fires = v.get("fires", 0)
         adopt = v.get("adoption_rate")
         if adopt is None:
@@ -440,7 +485,8 @@ class _Budget:
 def _distill_via_llm(ground_truth, store, llm=None, *, group_size=TFGRPO_GROUP_SIZE,
                      epochs=1, repo="", stack="",
                      rollout=None, score=None, distill_advantage=None,
-                     cache=None, max_llm_calls=None, max_workers=None):
+                     cache=None, max_llm_calls=None, max_workers=None, skip_types=None,
+                     min_source_prs=None, max_reward_var=None):
     """TF-GRPO 入口（实现）。机制设计见 docs/learning-loop-design.html §3。
     ground_truth: 最小真值集 [{pr_id, repo, stack, summary, diff, human_adopted:[finding_type]}]
                   —— 历史已合 PR + 人审裁决（生产由 calibrate 从 GitHub 重建）。
@@ -469,12 +515,21 @@ def _distill_via_llm(ground_truth, store, llm=None, *, group_size=TFGRPO_GROUP_S
     cache_obj = _load_cache(cache)
     budget = _Budget(max_llm_calls)
     acc = {}
+    # 差距2a：跨 PR 一致性——按 candidate id 记每个【unique pr_id】的组均 reward（瞬态，不进 store）。
+    # 用 {pr_id: reward} 去重：同一 PR 多 epoch 的 rollout 只算一个跨 PR 样本（design 要"跨 PR 一致"，
+    # 非"跨 epoch 一致"）。下方 return 前据此过滤运气型 outlier。
+    reward_hist = {}
     try:                                    # 评审 item 3：循环中途失败也落盘已采缓存（finally）
         for _ in range(max(1, epochs)):
             # 每轮用「已有 active + 本轮已蒸出候选」重渲染 E，下一轮在更新后的 E 上 rollout（I2）
             cond = {"experiences": base_active + [dict(c, status="active") for c in acc.values()]}
             experience_text = render_injection(cond)
             for pr in ground_truth or []:
+                # 差距3a 收敛跳过：本 PR 所有 raised_types 都已 stable → 跳过 rollout+内省（省 G+1 次旗舰
+                # 调用）。混合 type（部分未收敛）仍照常处理——不能因一个稳定 type 牺牲同 PR 其他 type 信号。
+                pr_types = {t for t in (pr.get("raised_types") or []) if t}
+                if skip_types and pr_types and pr_types <= skip_types:
+                    continue
                 key = (_rollout_cache_key(pr, experience_text, group_size, rollout_tag=rollout_tag)
                        if cache_obj is not None else None)
                 if cache_obj is not None and key in cache_obj:
@@ -521,6 +576,14 @@ def _distill_via_llm(ground_truth, store, llm=None, *, group_size=TFGRPO_GROUP_S
                         prev["updated_at"] = c["updated_at"]
                     else:
                         acc[c["id"]] = c
+                    # 差距2a：记录本 PR 对该 candidate 的组均 reward（按 pr_id 去重）
+                    if rewards:
+                        pid = pr.get("pr_id")
+                        # PRA round-5：pr_id 缺失时 str(None)="None" 会把多个无 id 的 PR 奖励
+                        # 合并到同一 key，污染方差。跳过缺失 pr_id 的记录（不污染 reward_hist）。
+                        if pid is not None:
+                            rh = reward_hist.setdefault(c["id"], {})
+                            rh[str(pid)] = round(sum(rewards) / len(rewards), 4)
             if budget.exhausted:
                 break                              # 预算耗尽：不再开下一 epoch
     finally:
@@ -528,13 +591,57 @@ def _distill_via_llm(ground_truth, store, llm=None, *, group_size=TFGRPO_GROUP_S
             print(f"[distill] LLM 预算耗尽，跳过 {len(budget.skipped_prs)} 个 PR："
                   f"{budget.skipped_prs}（调 TOUCHSTONE_ROLLOUT_BUDGET / 增量水位）", file=sys.stderr)
         _save_cache(cache_obj, cache)              # 中途失败也落盘（评审 item 3）
-    return list(acc.values())
+    # 差距2a 跨 PR 一致性过滤（默认 min_source_prs=1、max_var=None → 不过滤=现状）：
+    #   ① source_prs 数 < min_source_prs → 丢（仅 1 PR 的运气型 outlier）。
+    #   ② 跨 PR reward 方差 > max_reward_var → 丢（跨 PR 不一致：某 type 仅个别 PR 高 reward）。
+    return _filter_by_consistency(acc, reward_hist, min_source_prs, max_reward_var)
+
+
+def _filter_by_consistency(acc, reward_hist, min_source_prs, max_reward_var):
+    """差距2a：按跨 PR 一致性过滤蒸馏候选。纯函数。
+    min_source_prs<=1 且 max_reward_var is None → 不过滤（默认=零行为变化）。"""
+    # 两闸 None 均回退各自 env reader（对称）：PRA round-4 distill.py:595——旧 min_source_prs=None
+    # 回退常量 DEFAULT（忽略 env），而 max_reward_var=None 回退 env reader，不对称致直接调用
+    # _distill_via_llm(min_source_prs=None) 时 env 覆盖被静默忽略。生产 _tfgrpo_distiller 已显式
+    # 解析两 env 传入不受影响；env 未设时 _distill_min_source_prs() 返回 DEFAULT(1)，零行为变化。
+    min_sp = _distill_min_source_prs() if min_source_prs is None else min_source_prs
+    max_var = max_reward_var if max_reward_var is not None else _distill_max_reward_var()
+    if min_sp <= 1 and max_var is None:
+        return list(acc.values())             # 默认关：不过滤
+    kept, dropped = [], []
+    for cid, c in acc.items():
+        rh = reward_hist.get(cid, {})
+        n_prs = len(rh) or len(c.get("source_prs") or [])   # rh 优先（按 pr_id 去重）；fallback source_prs
+        if min_sp > 1 and n_prs < min_sp:
+            dropped.append((cid, f"<{min_sp} PRs ({n_prs})")); continue
+        # PRA round-1/2（distill.py:583/594 "单 PR 绕过方差"）：单 PR 候选 pvariance≡0（单点
+        # 无方差），自然 ≤ max_var 必留——不是"绕过"，是方差对单点无信息量。其"证据是否充足"
+        # 由上面 min_source_prs 闸管（正交职责：min_sp=样本量门槛、max_var=既有样本一致性门槛）。
+        # 两闸可组合覆盖全部意图（无缺失功能）：
+        #   min_sp=1 + var=None  → 不过滤（默认）
+        #   min_sp=1 + var=0.1   → 留单 PR，多 PR 按方差过滤
+        #   min_sp=2 + var=None  → 丢单 PR（样本量门槛）
+        #   min_sp=2 + var=0.1   → 丢单 PR + 多 PR 按方差过滤
+        # 评审所谓"variance-only 且丢单 PR"= 第 4 行（min_sp=2），可达。
+        # PRA round-5：方差闸要求既有 reward 数据——rh 空时 _pvariance([])=0.0 恒 ≤ max_var 会
+        # 静默放行无证据候选（rewards 未录 / score 返空 / pr_id 缺失被跳过）。fail-closed：
+        # max_var 启用且 rh 空时丢弃（无可校验一致性的数据）。默认 max_var=None 不入此支，零行为变化。
+        if max_var is not None and not rh:
+            dropped.append((cid, "no reward history for variance check")); continue
+        if max_var is not None and _pvariance(list(rh.values())) > max_var:
+            dropped.append((cid, f"reward_var>{max_var}")); continue
+        kept.append(c)
+    if dropped:
+        print(f"[distill] 差距2a 一致性过滤：丢弃 {len(dropped)} 条运气/不一致 candidate："
+              f"{dropped}（调 TOUCHSTONE_DISTILL_MIN_SOURCE_PRS / _MAX_REWARD_VAR）", file=sys.stderr)
+    return kept
 
 
 # --- 蒸馏器分发：按名选实现 + 注册自定义（照搬 review_provider 的分发风格）---------------
 #   蒸馏上下文 ctx（统一入参，各实现按需取用）：{calib_agg, ground_truth, store, llm, repo, stack}
 def _counting_distiller(ctx):
-    return distill_candidates(ctx.get("calib_agg") or {}, ctx.get("repo", ""), ctx.get("stack", ""))
+    return distill_candidates(ctx.get("calib_agg") or {}, ctx.get("repo", ""), ctx.get("stack", ""),
+                             skip_types=ctx.get("skip_types"))
 
 
 def _env_rollout_cache():
@@ -561,9 +668,14 @@ def _tfgrpo_distiller(ctx):
     cache = ctx.get("cache", _env_rollout_cache())
     budget = ctx.get("max_llm_calls", _env_int_opt("TOUCHSTONE_ROLLOUT_BUDGET"))
     workers = ctx.get("max_workers", _env_int_opt("TOUCHSTONE_ROLLOUT_WORKERS"))
+    # 差距2a 跨 PR 一致性：ctx 显式传入优先，否则读 env（默认 min=1/var=None=不过滤=现状）。
+    min_sp = ctx.get("min_source_prs", _distill_min_source_prs())
+    max_var = ctx.get("max_reward_var", _distill_max_reward_var())
     return _distill_via_llm(ctx.get("ground_truth") or [], ctx.get("store") or {"experiences": []},
                             ctx.get("llm"), repo=ctx.get("repo", ""), stack=ctx.get("stack", ""),
-                            cache=cache, max_llm_calls=budget, max_workers=workers)
+                            cache=cache, max_llm_calls=budget, max_workers=workers,
+                            skip_types=ctx.get("skip_types"),
+                            min_source_prs=min_sp, max_reward_var=max_var)
 
 
 _DISTILLERS = {"counting": _counting_distiller, "tfgrpo": _tfgrpo_distiller}

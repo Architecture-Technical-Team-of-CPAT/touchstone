@@ -199,10 +199,20 @@ def _lgtm_only(reviews, human_state, bot_login, body_max):
 
 
 def _is_trusted_marker_author(login, bot_login):
-    """marker 信任根：只认 touchstone 自己（PAT 身份或 [bot] 后缀）发的评论里的 marker。
+    """marker 信任根：只认 touchstone 自己发的评论里的 marker。
     防 PR author/任意评论者发假 <!-- touchstone-result/finding/auto_handled --> marker 伪造
-    校准/学习/熔断数据——这是整个自学习闭环的信任根。"""
-    return bool(login) and (login == bot_login or login.endswith("[bot]"))
+    校准/学习/熔断数据——这是整个自学习闭环的信任根。
+
+    bot_login 已知（GET /user 成功，如 PAT 部署）→ 精确按该 login 过滤（与 loop.trusted_bodies
+    同口径）。此前【即便 bot_login 已知】也接受任意 [bot] 后缀账号（dependabot[bot]、renovate[bot]…）
+    的 marker——系统级口子（result/finding marker 决定 adopted/raised_types 核心信号），本 PR 收紧。
+    bot_login 未知（GET /user 失败，如默认 GITHUB_TOKEN）→ 退回 [bot] 后缀兜底（PR #27：
+    GitHub 保留 [bot] 给 bot 账号、人无法注册，仍防人伪造；与 loop.trusted_bodies 降级路径逐字一致）。"""
+    if not login:
+        return False
+    if bot_login:
+        return login == bot_login
+    return login.endswith("[bot]") or login == "github-actions"
 
 
 def _trusted_bodies(comments, bot_login):

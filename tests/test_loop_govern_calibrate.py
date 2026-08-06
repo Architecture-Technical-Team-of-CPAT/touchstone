@@ -377,6 +377,42 @@ def test_trusted_bodies_filters_forged_marker():
     assert loop.trusted_bodies(comments2, None) == []
 
 
+def test_is_trusted_marker_author_exact_match_when_bot_login_known():
+    """bot_login 已知 → 精确匹配，不再宽信任意 [bot] 账号（与 loop.trusted_bodies 同口径）。
+
+    此前 _is_trusted_marker_author 即便 bot_login 已知也接受 login.endswith('[bot]')，于是
+    dependabot[bot]/renovate[bot] 等 repo 内任何 [bot] 账号发的 result/finding/checklist marker
+    都被信——系统级口子（result marker 决定 adopted/raised_types 核心信号）。本测试锁死收紧。"""
+    f = calibrate._is_trusted_marker_author
+    # bot_login 已知 → 只认它自己
+    assert f("github-actions[bot]", "github-actions[bot]") is True
+    assert f("my-touchstone-bot[bot]", "my-touchstone-bot[bot]") is True
+    # 同 repo 的其它 [bot] 账号 → 拒（关键：旧实现这里会误信）
+    assert f("dependabot[bot]", "github-actions[bot]") is False
+    assert f("renovate[bot]", "github-actions[bot]") is False
+    # 人类 / author / 空 → 拒
+    assert f("some-user", "github-actions[bot]") is False
+    assert f("", "github-actions[bot]") is False
+    assert f(None, "github-actions[bot]") is False
+
+
+def test_is_trusted_marker_author_suffix_fallback_when_bot_login_unknown():
+    """bot_login 未知（GET /user 失败，默认 GITHUB_TOKEN 常见）→ 退回 [bot] 后缀兜底（PR #27）。
+
+    PR #27 既定语义：身份未知时不退回全量（那样 author 可伪造 marker）、改按 [bot] 后缀过滤——
+    GitHub 保留 [bot] 给 bot 账号、人无法注册，仍防人伪造。本 PR 收紧【已知】路径但【未知】降级
+    路径行为不变；本测试守住院线，防回归。"""
+    f = calibrate._is_trusted_marker_author
+    # bot_login=None → [bot] 后缀兜底（接受任何 bot，因身份未知无法更严）
+    assert f("github-actions[bot]", None) is True
+    assert f("dependabot[bot]", None) is True          # 降级路径：接受（无法区分是哪个 bot）
+    # 旧格式兼容：login 恰为 "github-actions"（无后缀）→ 仍认（与 loop._is_bot_login 同口径）
+    assert f("github-actions", None) is True
+    # 人类 / 空 → 拒（防伪造不降级）
+    assert f("attacker", None) is False
+    assert f("", None) is False
+
+
 def test_author_self_resolve_not_counted_as_adoption():
     """作者自己 resolve 自己 PR 的 bot 发现线程 → 不算采纳（防伪造正例毒化学习奖励）。"""
     import json

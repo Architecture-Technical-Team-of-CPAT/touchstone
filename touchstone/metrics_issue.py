@@ -140,6 +140,10 @@ def _render_trend(agg):
         ("评审可信率", _pct(agg.get("review_reliable_rate"))),
         ("收敛率", _pct(agg.get("converged_rate"))),
         ("静默故障轮", _b(agg.get("silent_failure_rounds"))),
+        # 单侧失败趋势：improve 连挂而 review 正常时，可信率/引擎分布都看着正常——这行让这类隐身
+        # 降级（run-285 那种）在趋势上可见。imp/rev 分别计数（fan-out 下另一侧仍可信）。
+        ("单侧失败轮(imp/rev)",
+         f"{_b(agg.get('improve_degraded_rounds'))} / {_b(agg.get('review_degraded_rounds'))}"),
         ("被自证闸拦", _b(agg.get("blocked_by_unverified_claims"))),
         ("引擎分布", _b(agg.get("engine_status_dist"))),
     ])

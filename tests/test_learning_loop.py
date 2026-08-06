@@ -614,7 +614,7 @@ def test_build_ground_truth_from_human_verdicts(tmp_path, monkeypatch):
             return [{"number": 1, "title": "fix bug", "merged_at": "2026-01-01"},
                     {"number": 2, "title": "docs", "merged_at": None}]
         if "issues/1/comments" in path:
-            return [{"body": marker}]
+            return [{"body": marker, "user": {"login": "github-actions[bot]"}}]
         if "issues/2/comments" in path:
             return []                                                       # 无 marker → 跳过
         if "pulls/1/reviews" in path:
@@ -655,7 +655,7 @@ def test_build_ground_truth_excludes_author_self_resolve(tmp_path, monkeypatch):
             return [{"number": 1, "title": "fix", "merged_at": "2026-01-01",
                      "user": {"login": "author1"}}]      # PR 作者 = author1 = 线程解决者
         if "issues/1/comments" in path:
-            return [{"body": marker}]
+            return [{"body": marker, "user": {"login": "github-actions[bot]"}}]
         if "pulls/1/reviews" in path:
             return []
         if "pulls/1/files" in path:
@@ -683,7 +683,7 @@ def test_build_ground_truth_carries_injected_types_from_marker(tmp_path, monkeyp
         if "state=closed" in path:
             return [{"number": 1, "title": "t", "merged_at": "2026-01-01"}]
         if "issues/1/comments" in path:
-            return [{"body": marker}]
+            return [{"body": marker, "user": {"login": "github-actions[bot]"}}]
         if "pulls/1/reviews" in path:
             return [{"state": "APPROVED", "user": {"login": "alice"}}]
         if "pulls/1/files" in path:
@@ -704,6 +704,180 @@ def test_make_gt_entry_carries_injected_and_raised():
                         injected_types=["PRA-A", "PRA-C"])
     assert e["raised_types"] == ["PRA-A", "PRA-B"]
     assert e["injected_types"] == ["PRA-A", "PRA-C"]
+
+
+# ---------------- waived（author 豁免 + 人合入）→ 确认噪声标签（Phase 1：仅采集透传）----------------
+def _result_marker(findings, **extra):
+    return "<!-- touchstone-result: " + json.dumps({"findings": findings, **extra}) + " -->"
+
+
+def _checklist_marker(items):
+    cl = {"round": 1, "items": items, "resolved_rate": 1.0}
+    return "<!-- touchstone-checklist: " + json.dumps(cl, ensure_ascii=False) + " -->"
+
+
+def _bg_patch_single_pr(monkeypatch, *, comment_body, merged=True, threads=None, pr_number=1):
+    """给 build_ground_truth 打桩：单 PR，给定评论正文（含 marker）+ 合入态 + 评审线程。
+    comment_body 以 github-actions[bot] 身份发出（受信 marker 作者）。"""
+    from touchstone import calibrate as C
+    def fake_gh(path, token, accept="application/vnd.github+json"):
+        if "state=closed" in path:
+            return [{"number": pr_number, "title": "t",
+                     "merged_at": "2026-01-01" if merged else None}]
+        if f"issues/{pr_number}/comments" in path:
+            return [{"body": comment_body, "user": {"login": "github-actions[bot]"}}]
+        if f"pulls/{pr_number}/reviews" in path:
+            return []
+        if f"pulls/{pr_number}/files" in path:
+            return [{"filename": "a.py"}]
+        if path.endswith(f"/pulls/{pr_number}") and accept.endswith("diff"):
+            return "+x"
+        return []
+    monkeypatch.setattr(GT, "_gh_get", fake_gh)
+    monkeypatch.setattr(C, "gql", lambda q, v, t: threads or {"data": {}})
+
+
+def test_make_gt_entry_human_waived_is_optional_and_independent():
+    # 不传 human_waived → 无该字段（向后兼容）
+    e = L.make_gt_entry(1, "o/r", "py", "t", "d", [{"rule_id": "PRA-A"}], set(), "APPROVED", True)
+    assert "human_waived" not in e
+    # 传 → 排序去空；与 adopted/ignored 独立（waived 是 ignored 的带信心子集标注，不改它们）
+    e2 = L.make_gt_entry(1, "o/r", "py", "t", "d",
+                         [{"rule_id": "PRA-A"}, {"rule_id": "PRA-B"}],
+                         {"PRA-A"}, "APPROVED", True, human_waived={"PRA-B", "PRA-C", ""})
+    assert e2["human_waived"] == ["PRA-B", "PRA-C"]
+    assert e2["human_adopted"] == ["PRA-A"]
+    assert e2["human_ignored"] == ["PRA-B"]      # PRA-B 仍在 ignored（waived 不把它移走）
+
+
+def test_make_gt_entry_waived_requires_merged_gate():
+    # merge 闸在【数据边界】强制（信任根③）：外部调用方绕过 _waived_types 直接传 human_waived 时，
+    # 未合入的 PR 也不得带"确认噪声"标签（waived 是 author 自证，须 merge 背书）。防 :100 重开。
+    unmerged = L.make_gt_entry(1, "o/r", "py", "t", "d", [{"rule_id": "PRA-W"}], set(),
+                               "APPROVED", False, human_waived={"PRA-W"})
+    assert "human_waived" not in unmerged         # merged=False → 不发，即便传了 human_waived
+    merged = L.make_gt_entry(1, "o/r", "py", "t", "d", [{"rule_id": "PRA-W"}], set(),
+                             "APPROVED", True, human_waived={"PRA-W"})
+    assert merged["human_waived"] == ["PRA-W"]    # merged=True → 发
+
+
+def test_build_ground_truth_records_waived_when_merged(monkeypatch):
+    """waived + 人合入 → 进 human_waived（确认噪声标签）。信任根③：merge 闸。"""
+    body = _result_marker([{"rule_id": "PRA-W"}]) + "\n" + _checklist_marker(
+        [{"sig": "PRA-W:src/a.py:10", "status": "waived", "note": "测试夹具"}])
+    _bg_patch_single_pr(monkeypatch, merged=True, comment_body=body)
+    entry = L.build_ground_truth("o", "r", "tok")[0]
+    assert entry.get("human_waived") == ["PRA-W"]
+
+
+def test_build_ground_truth_no_waived_when_not_merged(monkeypatch):
+    """waived 是 author 自证：未合入 → 不采信、不产 human_waived 字段。"""
+    body = _result_marker([{"rule_id": "PRA-W"}]) + "\n" + _checklist_marker(
+        [{"sig": "PRA-W:src/a.py:10", "status": "waived", "note": "测试夹具"}])
+    _bg_patch_single_pr(monkeypatch, merged=False, comment_body=body)
+    entry = L.build_ground_truth("o", "r", "tok")[0]
+    assert "human_waived" not in entry
+
+
+def test_build_ground_truth_short_circuits_waived_parsing_when_unmerged(monkeypatch):
+    """PRA-GENERAL:ground_truth.py:230——未合入时守卫前置，不进入 _waived_types 的清单解析。
+    防：内部守卫（_waived_types 的 `if not merged: return set()`）一旦被误删即泄漏 + 白跑
+    parse_latest/_trusted_bodies；调用点短路 = 第二道闸，且更省。"""
+    body = _result_marker([{"rule_id": "PRA-W"}]) + "\n" + _checklist_marker(
+        [{"sig": "PRA-W:src/a.py:10", "status": "waived", "note": "测试夹具"}])
+    _bg_patch_single_pr(monkeypatch, merged=False, comment_body=body)
+    calls = []
+    orig = GT._waived_types
+    def spy(*a, **k):
+        calls.append((a, k))
+        return orig(*a, **k)
+    monkeypatch.setattr(GT, "_waived_types", spy)
+    entry = L.build_ground_truth("o", "r", "tok")[0]
+    assert calls == []                      # 未合入 → _waived_types 根本不被调用（守卫前置）
+    assert "human_waived" not in entry      # 数据边界 merge 闸亦兜底
+
+
+def test_build_ground_truth_waived_scoped_to_raised_types(monkeypatch):
+    """waived 仅限本 PR 真挑过的类型：waived 了没挑过的 → 不进 human_waived。信任根④。"""
+    body = _result_marker([{"rule_id": "PRA-W"}]) + "\n" + _checklist_marker([
+        {"sig": "PRA-W:src/a.py:10", "status": "waived", "note": "x"},
+        {"sig": "PRA-OTHER:src/b.py:3", "status": "waived", "note": "y"}])
+    _bg_patch_single_pr(monkeypatch, merged=True, comment_body=body)
+    entry = L.build_ground_truth("o", "r", "tok")[0]
+    assert entry.get("human_waived") == ["PRA-W"]    # PRA-OTHER 未挑过 → 不进
+
+
+def test_build_ground_truth_waived_ignores_untrusted_marker(monkeypatch):
+    """非 bot 发的清单 marker 不信（信任根①：只信 bot 评论里的 marker，防伪造豁免污染负例）。"""
+    from touchstone import calibrate as C
+    def fake_gh(path, token, accept="application/vnd.github+json"):
+        if "state=closed" in path:
+            return [{"number": 1, "title": "t", "merged_at": "2026-01-01"}]
+        if "issues/1/comments" in path:
+            # result marker 由受信 bot 发（保证 entry 存在、可断言 waived 字段）；
+            # checklist（waived）marker 由 alice 发——非 bot，须被丢，不产 human_waived。
+            return [
+                {"body": _result_marker([{"rule_id": "PRA-W"}]),
+                 "user": {"login": "github-actions[bot]"}},
+                {"body": _checklist_marker(
+                    [{"sig": "PRA-W:src/a.py:10", "status": "waived", "note": "x"}]),
+                 "user": {"login": "alice"}},            # 非 bot 发的假清单
+            ]
+        if "pulls/1/reviews" in path:
+            return []
+        if "pulls/1/files" in path:
+            return [{"filename": "a.py"}]
+        if path.endswith("/pulls/1") and accept.endswith("diff"):
+            return "+x"
+        return []
+    monkeypatch.setattr(GT, "_gh_get", fake_gh)
+    monkeypatch.setattr(C, "gql", lambda q, v, t: {"data": {}})
+    entry = L.build_ground_truth("o", "r", "tok")[0]
+    assert "human_waived" not in entry
+
+
+def test_build_ground_truth_result_marker_from_other_bot_rejected(monkeypatch):
+    """信任根①（result marker）：dependabot[bot] 等同 repo 其它 [bot] 账号冒充 touchstone 发的
+    假 result marker 不得伪造 raised_types/injected_types 核心信号。
+
+    此前两道口子叠加：① build_ground_truth 把【全部评论 body】喂给 _parse_result（不过滤作者）；
+    ② _is_trusted_marker_author 即便 bot_login 已知也宽认 [bot] 后缀。两修合璧后 dependabot[bot]
+    的 result marker 被丢 → 无受信 result → 跳 PR → 空真值集。锁死端到端不 regression。"""
+    from touchstone import calibrate as C
+    body = _result_marker([{"rule_id": "PRA-X"}])     # dependabot[bot] 冒充发的假 result marker
+    def fake_gh(path, token, accept="application/vnd.github+json"):
+        if "state=closed" in path:
+            return [{"number": 1, "title": "t", "merged_at": "2026-01-01"}]
+        if "issues/1/comments" in path:
+            return [{"body": body, "user": {"login": "dependabot[bot]"}}]  # 非 touchstone 的 [bot]
+        if "pulls/1/reviews" in path:
+            return []
+        if "pulls/1/files" in path:
+            return [{"filename": "a.py"}]
+        if path.endswith("/pulls/1") and accept.endswith("diff"):
+            return "+x"
+        return []
+    monkeypatch.setattr(GT, "_gh_get", fake_gh)
+    monkeypatch.setattr(C, "gql", lambda q, v, t: {"data": {}})
+    # dependabot[bot] != 默认 bot_login(github-actions[bot]) → result marker 不被信 → _parse_result
+    # 返回 None → build_ground_truth 跳过该 PR → 空列表（无伪造 raised_types 进真值集）
+    assert L.build_ground_truth("o", "r", "tok") == []
+
+
+def test_build_ground_truth_waived_does_not_change_adopted_or_ignored(monkeypatch):
+    """Phase 1 向后兼容：采信 waived 不改 human_adopted / human_ignored，仅新增标注字段。"""
+    finding_marker = "<!-- touchstone-finding: " + json.dumps({"rule_id": "PRA-ADOPT"}) + " -->"
+    threads = {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+        {"isResolved": True, "comments": {"nodes": [
+            {"author": {"login": "github-actions[bot]"}, "body": finding_marker}]}}
+    ]}}}}}
+    body = (_result_marker([{"rule_id": "PRA-ADOPT"}, {"rule_id": "PRA-W"}]) + "\n"
+            + _checklist_marker([{"sig": "PRA-W:src/a.py:10", "status": "waived", "note": "x"}]))
+    _bg_patch_single_pr(monkeypatch, merged=True, comment_body=body, threads=threads)
+    entry = L.build_ground_truth("o", "r", "tok")[0]
+    assert entry["human_adopted"] == ["PRA-ADOPT"]     # 不变
+    assert entry["human_ignored"] == ["PRA-W"]         # PRA-W 仍在 ignored（未移走）
+    assert entry.get("human_waived") == ["PRA-W"]      # 额外标注：PRA-W 是确认豁免
 
 
 # -------- shadow 注入采 A/B with 臂（冷启动破死锁 step2：aggregate_ab 拓宽 with 臂判据）--------
@@ -781,7 +955,7 @@ def test_build_ground_truth_carries_shadow_types_from_marker(tmp_path, monkeypat
         if "state=closed" in path:
             return [{"number": 1, "title": "t", "merged_at": "2026-01-01"}]
         if "issues/1/comments" in path:
-            return [{"body": marker}]
+            return [{"body": marker, "user": {"login": "github-actions[bot]"}}]
         if "pulls/1/reviews" in path:
             return [{"state": "APPROVED", "user": {"login": "alice"}}]
         if "pulls/1/files" in path:
@@ -1434,7 +1608,7 @@ def test_truth_quality_disabled_by_default(monkeypatch):
         if "state=closed" in path:
             return [{"number": 1, "title": "t", "merged_at": "x"}]
         if "issues/1/comments" in path:
-            return [{"body": result_marker}]
+            return [{"body": result_marker, "user": {"login": "github-actions[bot]"}}]
         if "pulls/1/reviews" in path:
             return [{"state": "APPROVED", "user": {"login": "alice"}, "body": "lgtm"}]  # 命中 B
         if "pulls/1/files" in path:
@@ -1473,7 +1647,7 @@ def test_hard_drop_removes_entry(monkeypatch, capsys):
             return [{"number": 1, "title": "t1", "merged_at": "x"},
                     {"number": 2, "title": "t2", "merged_at": "x"}]
         if "issues/1/comments" in path or "issues/2/comments" in path:
-            return [{"body": result_marker}]
+            return [{"body": result_marker, "user": {"login": "github-actions[bot]"}}]
         if "pulls/1/reviews" in path or "pulls/2/reviews" in path:
             return [{"state": "APPROVED", "user": {"login": "alice"}, "body": "lgtm"}]  # B
         if "pulls/1/files" in path or "pulls/2/files" in path:
@@ -1614,6 +1788,16 @@ def test_resolve_taxonomy_default_off(monkeypatch):
     assert L._resolve_taxonomy({"experiences": []}) is None          # 默认关 = 不启用
 
 
+def test_resolve_taxonomy_treats_present_but_empty_as_unset(monkeypatch):
+    # learn.yml 的 ${{ vars.TOUCHSTONE_TAXONOMY_ENFORCE }} 未设时 GHA 求值为空串、传入 present-but-empty
+    # 的 TOUCHSTONE_TAXONOMY_ENFORCE=（≠ 未设）。_resolve_taxonomy 须把空串/纯空白归一到 None（=未设），
+    # 让 "空/未设 → taxonomy=None" 的注释语义与实际路径一致，不靠 else 分支巧合落同结果。
+    monkeypatch.setenv("TOUCHSTONE_TAXONOMY_ENFORCE", "")
+    assert L._resolve_taxonomy({"experiences": []}) is None
+    monkeypatch.setenv("TOUCHSTONE_TAXONOMY_ENFORCE", "   ")         # 纯空白也归一
+    assert L._resolve_taxonomy({"experiences": []}) is None
+
+
 def test_resolve_taxonomy_on_reads_pragent_yaml(tmp_path, monkeypatch):
     yaml = tmp_path / "pr-agent.yaml"
     yaml.write_text("normalization:\n  label_to_category:\n    possible bug: correctness\n    typo: convention\n")
@@ -1621,6 +1805,211 @@ def test_resolve_taxonomy_on_reads_pragent_yaml(tmp_path, monkeypatch):
     monkeypatch.setenv("TOUCHSTONE_PRAGENT_YAML", str(yaml))
     kt = L._resolve_taxonomy({"experiences": []})
     assert "PRA-POSSIBLE_BUG" in kt and "PRA-TYPO" in kt
+
+
+# ============================================================================
+# finding_type 归一化（合并大小写/分隔符变体，不丢弃）—— c2/c3 之外的独立卫生层
+# ============================================================================
+def test_canonical_type_preserves_pra_prefix_and_normalizes_rest():
+    # 'PRA-' 前缀连字符保留；rest 大写 + 分隔符→下划线（对齐 review_provider.normalize）
+    assert L._canonical_type("PRA-POSSIBLE_BUG") == "PRA-POSSIBLE_BUG"   # 已规范 → 不变
+    assert L._canonical_type("PRA-possible bug") == "PRA-POSSIBLE_BUG"
+    assert L._canonical_type("PRA-COVERAGE-GAP") == "PRA-COVERAGE_GAP"
+    assert L._canonical_type("PRA-COVERAGE_GAP") == "PRA-COVERAGE_GAP"
+    assert L._canonical_type("PRA-consistency") == "PRA-CONSISTENCY"
+    assert L._canonical_type("pra-coverage/scope") == "PRA-COVERAGE_SCOPE"
+    assert L._canonical_type("") == ""
+    # 非 'PRA-' 形（罕见 'pr-agent-*'）：保守，只大写 + 折叠空格/斜杠，不改命名空间连字符
+    assert L._canonical_type("pr-agent-foo") == "PR-AGENT-FOO"
+
+
+def test_merge_candidates_canonicalizes_incoming_variants():
+    # 两个大小写/分隔符变体经 merge 后应落到同一条目（同 canonical id），不是两条
+    store = {"experiences": []}
+    L.merge_candidates(store, [_cand("PRA-COVERAGE-GAP"), _cand("PRA-coverage_gap")])
+    fts = [e["finding_type"] for e in store["experiences"]]
+    assert fts == ["PRA-COVERAGE_GAP"]                      # 合并成一条规范形
+
+
+def test_merge_candidates_still_passes_unknown_when_taxonomy_off():
+    # 回归：归一化不改变"taxonomy 关时放行未知类型"的向后兼容（只是把它规范化）
+    store = {"experiences": []}
+    L.merge_candidates(store, [_cand("pra-whatever-thing")], taxonomy=None)
+    assert len(store["experiences"]) == 1
+    assert store["experiences"][0]["finding_type"] == "PRA-WHATEVER_THING"
+
+
+def test_canonicalize_store_merges_existing_dup_variants():
+    # 存量里同规律的多个变体 → 合一条，source_prs 并集、created_at=min/updated_at=max
+    e1 = _cand("PRA-CONSISTENCY"); e1["source_prs"] = ["10", "11"]; e1["created_at"] = 100; e1["updated_at"] = 110
+    e2 = _cand("PRA-consistency"); e2["source_prs"] = ["11", "12"]; e2["created_at"] = 90;  e2["updated_at"] = 200
+    e3 = _cand("PRA-COVERAGE_GAP")  # 无重复的规范条目（单条组：仅就地规范化校验）
+    store = {"experiences": [e1, e2, e3]}
+    L.canonicalize_store(store)
+    fts = sorted(e["finding_type"] for e in store["experiences"])
+    assert fts == ["PRA-CONSISTENCY", "PRA-COVERAGE_GAP"]   # e1/e2 合并成一条
+    merged = next(e for e in store["experiences"] if e["finding_type"] == "PRA-CONSISTENCY")
+    assert sorted(merged["source_prs"]) == ["10", "11", "12"]
+    assert merged["created_at"] == 90 and merged["updated_at"] == 200
+
+
+def test_canonicalize_store_idempotent():
+    e1 = _cand("PRA-consistency"); e1["source_prs"] = ["1"]
+    e2 = _cand("PRA-CONSISTENCY"); e2["source_prs"] = ["2"]
+    store = {"experiences": [e1, e2]}
+    L.canonicalize_store(store)
+    snap = json.dumps(store, sort_keys=True)
+    L.canonicalize_store(store)                              # 再跑一次
+    assert json.dumps(store, sort_keys=True) == snap         # 幂等：无二次变化
+
+
+def test_canonicalize_store_leaves_locked_and_human_untouched():
+    locked = _cand("PRA-consistency"); locked["locked"] = True
+    human = _cand("PRA-consistency"); human["source"] = "human"
+    plain = _cand("PRA-CONSISTENCY"); plain["source_prs"] = ["1"]
+    store = {"experiences": [locked, human, plain]}
+    L.canonicalize_store(store)
+    # locked / human 原样保留（不被合并、finding_type 不改）；plain 也不与其合并
+    assert any(e.get("locked") and e["finding_type"] == "PRA-consistency" for e in store["experiences"])
+    assert any(e.get("source") == "human" and e["finding_type"] == "PRA-consistency" for e in store["experiences"])
+    assert any(e["finding_type"] == "PRA-CONSISTENCY" and not e.get("locked") for e in store["experiences"])
+
+
+def test_canonicalize_store_does_not_drop_anything():
+    # 任何条目都不丢：合并减数、rename 不减数；总量 = 去重后
+    exps = [_cand("PRA-A"), _cand("pra-a"), _cand("PRA-B-b"), _cand("PRA-B_B")]
+    store = {"experiences": exps}
+    L.canonicalize_store(store)
+    fts = sorted(e["finding_type"] for e in store["experiences"])
+    assert fts == ["PRA-A", "PRA-B_B"]                      # 4 → 2，无丢弃
+
+
+def test_canonicalize_store_no_id_collision_with_locked_authoritative():
+    # 非权威变体不得被 rename 成与 locked/human 权威条目同 id（破坏 id 唯一性）。
+    # 权威 locked PRA-CONSISTENCY 占用 canonical id；非权威 PRA-consistency 须保留原 id，不撞。
+    nl = _cand("PRA-consistency"); nl["source_prs"] = ["1"]
+    locked = _cand("PRA-CONSISTENCY"); locked["locked"] = True; locked["source"] = "human"
+    locked["id"] = L._exp_id("PRA-CONSISTENCY", "emphasize", "o/r", "py")
+    store = {"experiences": [nl, locked]}
+    L.canonicalize_store(store)
+    ids = [e["id"] for e in store["experiences"]]
+    assert len(ids) == len(set(ids)), f"duplicate ids: {ids}"   # id 唯一
+    # 权威条目原样保留、非权威条目未被重命名进权威 id
+    assert any(e.get("locked") and e["finding_type"] == "PRA-CONSISTENCY" for e in store["experiences"])
+    assert any(e["id"] == L._exp_id("PRA-consistency", "emphasize", "o/r", "py") for e in store["experiences"])
+
+
+def test_canonicalize_store_merges_evidence_across_siblings():
+    # evidence 要合并（fires 求和、group_rewards 拼接、adoption 按 fires 加权平均），不只 source_prs
+    e1 = _cand("PRA-X"); e1["evidence"] = {"fires": 10, "adoption": 0.9, "group_rewards": [-2.5]}
+    e2 = _cand("pra-x"); e2["evidence"] = {"fires": 5, "adoption": 0.5, "group_rewards": [-3.5]}
+    store = {"experiences": [e1, e2]}
+    L.canonicalize_store(store)
+    assert len(store["experiences"]) == 1
+    ev = store["experiences"][0]["evidence"]
+    assert ev["fires"] == 15                                # 求和，不丢兄弟的累积计数
+    assert sorted(ev["group_rewards"]) == [-3.5, -2.5]      # 拼接
+    assert abs(ev["adoption"] - (10 * 0.9 + 5 * 0.5) / 15) < 1e-9   # fires 加权平均，与求和后的 fires 自洽
+
+
+def test_canonicalize_store_tiebreak_is_deterministic_by_index():
+    # 同 status + 同 source_prs 数：原始下标小者作代表 —— 稳定、可复现，不靠隐式迭代序
+    e1 = _cand("PRA-Y"); e1["text"] = "from index 0"; e1["source_prs"] = ["1"]
+    e2 = _cand("pra-y"); e2["text"] = "from index 1"; e2["source_prs"] = ["2"]   # 同 len=1
+    store = {"experiences": [e1, e2]}
+    L.canonicalize_store(store)
+    assert len(store["experiences"]) == 1
+    assert store["experiences"][0]["text"] == "from index 0"   # 下标小者（e1）作代表
+    assert sorted(store["experiences"][0]["source_prs"]) == ["1", "2"]
+
+
+def test_canonicalize_does_not_break_taxonomy_matching():
+    # _canonicalize_candidate 产下划线形（PRA-COVERAGE_GAP）；coerce_type 用 _normalize_type（全→连字符）
+    # 对称比较、分隔符无关——故 taxonomy 开时仍能软匹配白名单（无论白名单是连字符还是下划线形）。防回归。
+    s1 = {"experiences": []}
+    L.merge_candidates(s1, [_cand("PRA-COVERAGE-GAP")], taxonomy={"PRA-COVERAGE_GAP"})   # 白名单下划线
+    assert any(e["finding_type"] == "PRA-COVERAGE_GAP" for e in s1["experiences"])
+    s2 = {"experiences": []}
+    L.merge_candidates(s2, [_cand("PRA-COVERAGE_GAP")], taxonomy={"PRA-COVERAGE-GAP"})   # 白名单连字符
+    assert any(e["finding_type"] == "PRA-COVERAGE-GAP" for e in s2["experiences"])
+
+
+def test_merge_evidence_adoption_weighted_by_fires_not_rep_pick():
+    # adoption 是比率：合并时按 fires 加权平均（与求和后的 fires 自洽），不偏向代表单方面。防"Data loss"。
+    e1 = _cand("PRA-Z"); e1["evidence"] = {"fires": 8, "adoption": 1.0}   # 8/8 adopted
+    e2 = _cand("pra-z"); e2["evidence"] = {"fires": 2, "adoption": 0.0}   # 0/2 adopted
+    store = {"experiences": [e1, e2]}
+    L.canonicalize_store(store)
+    ev = store["experiences"][0]["evidence"]
+    assert ev["fires"] == 10
+    assert abs(ev["adoption"] - 0.8) < 1e-9                            # (8·1.0 + 2·0.0)/10 = 0.8，非代表的 1.0
+
+
+def test_merge_evidence_adoption_from_single_carrier_not_rep_none():
+    # 仅一个兄弟带 adoption 时（代表 e1 不带）：adoption 仍取该载体值，不被代表的 None 覆盖、不丢。防"Data loss"。
+    e1 = _cand("PRA-W"); e1["evidence"] = {"fires": 10}                 # 代表（index 0），无 adoption
+    e2 = _cand("pra-w"); e2["evidence"] = {"fires": 5, "adoption": 0.6} # 唯一 adoption 载体
+    store = {"experiences": [e1, e2]}
+    L.canonicalize_store(store)
+    ev = store["experiences"][0]["evidence"]
+    assert ev["fires"] == 15
+    assert abs(ev["adoption"] - 0.6) < 1e-9                            # 载体 e2 的 0.6，非代表缺失
+
+
+def test_canonicalize_store_preserves_sibling_only_list_field():
+    # 兄弟独有的顶层 list 字段（rep 没有）也要并集保留，不静默丢。防"Scan all siblings"。
+    e1 = _cand("PRA-V"); e1["evidence"] = {}                           # 代表（index 0），无 extra_log
+    e2 = _cand("pra-v"); e2["evidence"] = {}; e2["extra_log"] = ["a", "b"]   # sibling-only list
+    store = {"experiences": [e1, e2]}
+    L.canonicalize_store(store)
+    assert len(store["experiences"]) == 1
+    assert store["experiences"][0].get("extra_log") == ["a", "b"]      # sibling-only list 被保留
+
+
+def test_merge_evidence_adoption_preserved_when_carrier_has_no_fires():
+    # 兄弟只带 adoption 不带 fires（evidence={"adoption":0.5}）时，adoption 不得被静默丢弃。
+    # 代表 e1 无 adoption；e2 是唯一 adoption 载体但无 fires。合并后 adoption 仍取 e2 的值。防 :251 重开。
+    e1 = _cand("PRA-NF"); e1["evidence"] = {"fires": 10}               # 代表（index 0），无 adoption
+    e2 = _cand("pra-nf"); e2["evidence"] = {"adoption": 0.5}           # adoption 载体，无 fires
+    store = {"experiences": [e1, e2]}
+    L.canonicalize_store(store)
+    ev = store["experiences"][0]["evidence"]
+    assert ev["fires"] == 10                                           # e1 的 fires 保留（e2 无 fires 不计入）
+    assert abs(ev["adoption"] - 0.5) < 1e-9                            # e2 的 adoption 不丢
+
+
+def test_merge_evidence_adoption_averaged_when_no_fires_weights():
+    # 多个兄弟都只有 adoption（无 fires 可加权）→ 等权平均，不偏向代表、不丢任一信号。防 :251 重开。
+    e1 = _cand("PRA-NF2"); e1["evidence"] = {"adoption": 0.8}          # 代表（index 0）
+    e2 = _cand("pra-nf2"); e2["evidence"] = {"adoption": 0.4}
+    store = {"experiences": [e1, e2]}
+    L.canonicalize_store(store)
+    ev = store["experiences"][0]["evidence"]
+    assert "fires" not in ev                                           # 无 fires，不凭空造
+    assert abs(ev["adoption"] - 0.6) < 1e-9                            # (0.8+0.4)/2，非代表的 0.8
+
+
+def test_canonicalize_store_timestamp_merge_ignores_invalid_types():
+    # 手改/损坏的库可能存非数值时间戳（字符串/None）；min/max 不得 TypeError，坏值也不得污染合并时间。防 :373。
+    e1 = _cand("PRA-TS"); e1["created_at"] = 100; e1["updated_at"] = 110; e1["evidence"] = {}
+    e2 = _cand("pra-ts"); e2["created_at"] = "oops"; e2["updated_at"] = None; e2["evidence"] = {}
+    store = {"experiences": [e1, e2]}
+    L.canonicalize_store(store)                                        # 不抛 TypeError
+    merged = next(e for e in store["experiences"] if e["finding_type"] == "PRA-TS")
+    assert merged["created_at"] == 100                                 # 坏值跳过，min=唯一数值 100
+    assert merged["updated_at"] == 110                                 # 坏值跳过，max=唯一数值 110
+
+
+def test_canonical_type_folds_separator_variants_not_distinct_types():
+    # 分隔符【样式噪声】折叠（有意）：'PRA-A-B' / 'PRA-A_B' / 'PRA-A--B' / 'PRA-A B' → 同一规范形。
+    assert L._canonical_type("PRA-A-B") == "PRA-A_B"
+    assert L._canonical_type("PRA-A_B") == "PRA-A_B"
+    assert L._canonical_type("PRA-A--B") == "PRA-A_B"   # 连续分隔符折叠（样式噪声，非语义区分）
+    assert L._canonical_type("PRA-A B") == "PRA-A_B"
+    # 真正不同的类型【不撞】：分隔符有无仍区分、不同 token 亦然（折叠不损失信息）。确认归一化不 lossy。防 :155。
+    assert L._canonical_type("PRA-AB") != L._canonical_type("PRA-A_B")
+    assert L._canonical_type("PRA-FOO") != L._canonical_type("PRA-BAR")
+    assert L._canonical_type("PRA-A") != L._canonical_type("PRA-B")
 
 
 # ============================================================================
@@ -2009,7 +2398,8 @@ def test_build_ground_truth_carries_positions_to_gt_entry(tmp_path, monkeypatch)
         if path.endswith("/issues/1/comments?per_page=100"):                      # result marker（合法 JSON）
             return [{"body": ('<!-- touchstone-result: '
                               '{"findings":[{"rule_id":"PRA-A"}],'
-                              '"injected_types":["PRA-A"]} -->')}]
+                              '"injected_types":["PRA-A"]} -->'),
+                     "user": {"login": "github-actions[bot]"}}]
         if "/pulls/1/reviews" in path:
             return []
         if path.endswith("/pulls/1") and accept.endswith("diff"):
@@ -2047,7 +2437,8 @@ def test_build_ground_truth_drops_findings_with_null_line(tmp_path, monkeypatch)
         if path.endswith("/issues/1/comments?per_page=100"):   # result marker（合法 JSON）
             return [{"body": ('<!-- touchstone-result: '
                               '{"findings":[{"rule_id":"PRA-A"}],'
-                              '"injected_types":["PRA-A"]} -->')}]
+                              '"injected_types":["PRA-A"]} -->'),
+                     "user": {"login": "github-actions[bot]"}}]
         if "/pulls/1/reviews" in path:
             return []
         if path.endswith("/pulls/1") and accept.endswith("diff"):
@@ -2095,3 +2486,615 @@ def test_resolve_conflicts_recency_tiebreak_when_evidence_equal():
          "text": "NEW", "status": "active", "updated_at": 200, "source_prs": [], "evidence": {}}]}
     out = L.render_injection(store)
     assert "NEW" in out and "OLD" not in out
+
+
+# ---------------- 差距3a 收敛检测 ----------------
+
+def _active_text_exp(ftype, text, eid=None):
+    """一条 active 经验（无 convergence 字段——update_convergence 从无到有建立）。
+    与文件上方 _active_exp（retire 测试用）签名不同——本helper 显式带 text（收敛跟踪 text 哈希）。"""
+    return {"id": eid or f"emphasize:{ftype}", "repo": "", "stack": "",
+            "finding_type": ftype, "kind": "emphasize", "text": text,
+            "status": "active", "locked": False, "source_prs": [], "evidence": {},
+            "created_at": 1, "updated_at": 1}
+
+
+def _ab(ftype, *, with_seen, with_adopted, without_seen, without_adopted):
+    """构造单 type 的 ab_results（lift = with_adopted/with_seen - without_adopted/without_seen）。"""
+    return {ftype: {"with_seen": with_seen, "with_adopted": with_adopted,
+                    "without_seen": without_seen, "without_adopted": without_adopted}}
+
+
+def test_convergence_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("TOUCHSTONE_CONVERGENCE", raising=False)
+    store = {"experiences": [_active_text_exp("PRA-X", "t")]}
+    ab = _ab("PRA-X", with_seen=20, with_adopted=10, without_seen=20, without_adopted=4)
+    assert L.update_convergence(store, ab) == set()
+    assert "convergence" not in store["experiences"][0]            # 未开 → 字段都不写
+    assert L.converged_types(store) == set()
+
+
+def test_convergence_marks_stable_after_n_stable_rounds(monkeypatch):
+    monkeypatch.setenv("TOUCHSTONE_CONVERGENCE", "true")
+    monkeypatch.delenv("TOUCHSTONE_CONVERGE_N_STABLE", raising=False)   # 默认 3
+    store = {"experiences": [_active_text_exp("PRA-X", "stable text")]}
+    ab = _ab("PRA-X", with_seen=20, with_adopted=10, without_seen=20, without_adopted=4)   # lift=0.30
+    # 第 1 轮：无 prev → stable_rounds=0（建立基线，不能首轮就宣称稳定）
+    L.update_convergence(store, ab)
+    assert store["experiences"][0]["convergence"]["stable_rounds"] == 0
+    # 第 2、3 轮：text+lift 都不变 → +1 每次
+    L.update_convergence(store, ab)
+    assert store["experiences"][0]["convergence"]["stable_rounds"] == 1
+    L.update_convergence(store, ab)
+    assert store["experiences"][0]["convergence"]["stable_rounds"] == 2
+    assert store["experiences"][0]["convergence"]["state"] is None  # 2 < 3
+    # 第 4 轮：+1 → 3 → 标 stable
+    newly = L.update_convergence(store, ab)
+    assert store["experiences"][0]["convergence"]["stable_rounds"] == 3
+    assert store["experiences"][0]["convergence"]["state"] == "stable"
+    assert newly == {"PRA-X"}
+    assert L.converged_types(store) == {"PRA-X"}
+
+
+def test_convergence_resets_on_text_change(monkeypatch):
+    monkeypatch.setenv("TOUCHSTONE_CONVERGENCE", "true")
+    store = {"experiences": [_active_text_exp("PRA-X", "v1")]}
+    ab = _ab("PRA-X", with_seen=20, with_adopted=10, without_seen=20, without_adopted=4)
+    L.update_convergence(store, ab); L.update_convergence(store, ab)   # rounds 1-2 → stable_rounds=1
+    assert store["experiences"][0]["convergence"]["stable_rounds"] == 1
+    store["experiences"][0]["text"] = "v2-changed"                     # text 变 → 打破稳定
+    L.update_convergence(store, ab)
+    assert store["experiences"][0]["convergence"]["stable_rounds"] == 0
+    assert store["experiences"][0]["convergence"]["state"] is None
+
+
+def test_convergence_resets_on_lift_drift(monkeypatch):
+    monkeypatch.setenv("TOUCHSTONE_CONVERGENCE", "true")
+    monkeypatch.setenv("TOUCHSTONE_CONVERGE_LIFT_DRIFT", "0.05")
+    store = {"experiences": [_active_text_exp("PRA-X", "same text")]}
+    ab_hi = _ab("PRA-X", with_seen=20, with_adopted=10, without_seen=20, without_adopted=4)   # lift=0.30
+    ab_lo = _ab("PRA-X", with_seen=20, with_adopted=6, without_seen=20, without_adopted=4)    # lift=0.10
+    L.update_convergence(store, ab_hi); L.update_convergence(store, ab_hi)   # stable_rounds=1
+    assert store["experiences"][0]["convergence"]["stable_rounds"] == 1
+    L.update_convergence(store, ab_lo)      # lift 0.30→0.10，漂移 0.20 > 0.05 → 归零
+    assert store["experiences"][0]["convergence"]["stable_rounds"] == 0
+    assert store["experiences"][0]["convergence"]["state"] is None
+
+
+def test_convergence_lift_unavailable_holds_rounds(monkeypatch):
+    """样本不足（lift=None）时：text 不变维持 stable_rounds（不 +1 也不归零）。"""
+    monkeypatch.setenv("TOUCHSTONE_CONVERGENCE", "true")
+    store = {"experiences": [_active_text_exp("PRA-X", "same text")]}
+    ab_full = _ab("PRA-X", with_seen=20, with_adopted=10, without_seen=20, without_adopted=4)
+    ab_thin = _ab("PRA-X", with_seen=1, with_adopted=1, without_seen=20, without_adopted=4)  # with<min → None
+    L.update_convergence(store, ab_full); L.update_convergence(store, ab_full)   # stable_rounds=1
+    L.update_convergence(store, ab_thin)      # lift=None、text 不变 → 维持 1（不奖不罚）
+    assert store["experiences"][0]["convergence"]["stable_rounds"] == 1
+    assert store["experiences"][0]["convergence"]["last_lift"] is None
+
+
+def test_convergence_holds_on_sample_recovery(monkeypatch):
+    """PRA round-4（experience_store.py:589）：上轮样本不足（last_lift=None），本轮 lift 恢复可得、
+    text 不变 → stable_rounds 应维持（不归零）。旧实现此情况落 else 归零，惩罚了临时样本不足的臂。"""
+    monkeypatch.setenv("TOUCHSTONE_CONVERGENCE", "true")
+    store = {"experiences": [_active_text_exp("PRA-X", "same text")]}
+    ab_full = _ab("PRA-X", with_seen=20, with_adopted=10, without_seen=20, without_adopted=4)
+    ab_thin = _ab("PRA-X", with_seen=1, with_adopted=1, without_seen=20, without_adopted=4)  # with<min → None
+    L.update_convergence(store, ab_full); L.update_convergence(store, ab_full)   # stable_rounds=1
+    L.update_convergence(store, ab_thin)      # 样本不足 → last_lift=None，维持 1
+    assert store["experiences"][0]["convergence"]["last_lift"] is None
+    L.update_convergence(store, ab_full)      # 恢复：lift 可得但 prev_lift=None → 维持 1（不归零）
+    assert store["experiences"][0]["convergence"]["stable_rounds"] == 1
+    assert store["experiences"][0]["convergence"]["last_lift"] == 0.3
+
+
+def test_distill_candidates_skips_converged_types():
+    """counting 蒸馏跳过 skip_types（active 已稳定，不必产新候选）。"""
+    agg = _agg({"PRA-KEEP": {"fires": 12, "adoption_rate": 0.90},     # emphasize
+                "PRA-SKIP": {"fires": 15, "adoption_rate": 0.85}})    # emphasize but converged
+    out = L.distill_candidates(agg, "", "", skip_types={"PRA-SKIP"})
+    ftypes = {c["finding_type"] for c in out}
+    assert "PRA-KEEP" in ftypes and "PRA-SKIP" not in ftypes
+
+
+# ---------------- 差距3b 增量水位 ----------------
+
+def test_watermark_round_trip(tmp_path):
+    p = str(tmp_path / "wm.json")
+    L._write_watermark(p, 142, 7)
+    wm = L._read_watermark(p)
+    assert wm == {"watermark": 142, "round": 7}
+
+
+def test_read_watermark_missing_or_corrupt_returns_none(tmp_path):
+    assert L._read_watermark(str(tmp_path / "nope.json")) is None
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    assert L._read_watermark(str(bad)) is None
+
+
+def test_decide_since_pr_modes():
+    # 首轮：无水位 → 全量
+    assert L._decide_since_pr(None, force_full=False, full_every=4) == (None, "first")
+    assert L._decide_since_pr({"watermark": None, "round": 0}, force_full=False, full_every=4) == (None, "first")
+    # 增量：有水位、非对账轮
+    assert L._decide_since_pr({"watermark": 100, "round": 1}, force_full=False, full_every=4) == (100, "incremental")
+    # 周期性全量：round % every == 0
+    assert L._decide_since_pr({"watermark": 100, "round": 4}, force_full=False, full_every=4) == (None, "periodic_full")
+    # FORCE_REBUILD 优先 → 全量（即便非对账轮）
+    assert L._decide_since_pr({"watermark": 100, "round": 1}, force_full=True, full_every=4) == (None, "force_full")
+    # full_every<=0：永不周期性全量（纯增量）
+    assert L._decide_since_pr({"watermark": 100, "round": 4}, force_full=False, full_every=0) == (100, "incremental")
+
+
+def test_build_ground_truth_since_pr_filters_old_prs(monkeypatch):
+    """since_pr=N 时 number<=N 的 PR 不触发 per-PR 取数（省 ~5 次 API 调用）。"""
+    calls = []
+
+    def fake_gh_get(url, token, **kw):
+        calls.append(url)
+        if "state=closed" in url:                       # PR 列表
+            return [{"number": 100}, {"number": 101}, {"number": 102}]
+        return []                                        # per-PR 数据空 → result=None → continue
+
+    monkeypatch.setattr(GT, "_gh_get", fake_gh_get)
+    monkeypatch.setenv("TOUCHSTONE_BOT_LOGIN", "github-actions[bot]")
+
+    GT.build_ground_truth("o", "r", "tok", window=10, since_pr=100)
+    # PR 100 被过滤（100<=100）→ 不该出现任何 /100/ 的 per-PR 取数；101、102 应出现 comments 取数
+    per_pr_nums = {u.split("/issues/")[1].split("/")[0] for u in calls if "/issues/" in u}
+    assert "100" not in per_pr_nums
+    assert per_pr_nums == {"101", "102"}
+
+    # 对照：since_pr=None → 三个 PR 都取数
+    calls.clear()
+    GT.build_ground_truth("o", "r", "tok", window=10, since_pr=None)
+    per_pr_nums = {u.split("/issues/")[1].split("/")[0] for u in calls if "/issues/" in u}
+    assert per_pr_nums == {"100", "101", "102"}
+
+
+def test_watermark_never_resets_on_full_rebuild_with_low_pr_ids(monkeypatch, tmp_path):
+    """PRA round-1 回归（learning_loop.py:399）：周期性全量轮 since_pr=None，旧守卫
+    `if since_pr and new_wm < since_pr` 被跳过（since_pr=None 为假）→ 若本轮返回条目的 pr_id
+    均低于旧水位（窗口漂移 / pr_id 异常），水位被回写到更小值 → 下轮 since_pr 变小触发全量重跑，
+    丢失增量收益。修复：以旧水位为下限，增量轮与全量轮一致生效。"""
+    import touchstone.learning_loop as LL
+    # 预置水位 {100, round=4}：round 4 % full_every(4) == 0 → 周期性全量 → since_pr=None
+    wm_path = tmp_path / "wm.json"
+    LL._write_watermark(str(wm_path), 100, 4)
+    # 全量轮返回的条目 pr_id 均低于旧水位 100（模拟窗口漂移 / pr_id 异常 / 全量切片不含最新 PR）
+    monkeypatch.setattr(LL, "build_ground_truth",
+                        lambda *a, **k: [{"pr_id": 50}, {"pr_id": 51}])
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("TOUCHSTONE_INCREMENTAL", "true")          # 开增量 → 读水位
+    LL.main(["--build-ground-truth", "--ground-truth", str(tmp_path / "gt.json"),
+             "--store", str(tmp_path / "store.json"),
+             "--watermark", str(wm_path),
+             "--output", str(tmp_path / "report.json")])
+    # 水位不得回退到 51；应保持 100，round 推进到 5
+    assert LL._read_watermark(str(wm_path)) == {"watermark": 100, "round": 5}
+
+
+def test_pr_id_int_safe_extraction():
+    """PRA round-2（learning_loop.py:400 "Silent Exception Risk"）：_pr_id_int 必须对
+    缺失/非数字/int 型/str 型 pr_id 都安全返回 int 或 None，绝不抛 KeyError/ValueError/AttributeError。"""
+    assert L._pr_id_int({"pr_id": 100}) == 100                 # int 型
+    assert L._pr_id_int({"pr_id": "100"}) == 100               # str 型
+    assert L._pr_id_int({"pr_id": "  42 "}) == 42              # 带空白
+    assert L._pr_id_int({}) is None                            # 缺失
+    assert L._pr_id_int({"pr_id": None}) is None               # 显式 None
+    assert L._pr_id_int({"pr_id": ""}) is None                 # 空串
+    assert L._pr_id_int({"pr_id": "abc"}) is None              # 非数字
+    assert L._pr_id_int({"pr_id": "-1"}) is None               # 负数（isdigit 拒 '-')
+    assert L._pr_id_int({"pr_id": "12.5"}) is None             # 浮点串
+
+
+def test_watermark_advances_round_on_empty_ground_truth(monkeypatch, tmp_path):
+    """PRA round-2（learning_loop.py:399 "round counter never advancing"）：空 ground_truth
+    时 round 必须仍前进。旧门控 `if wm_state is not None and ground_truth:`（truthy）在 [] 时
+    跳过整块 → round 不增；若 round 卡在周期性全量边界（%full_every==0）会陷入反复全量死循环。
+    修复：门控改 `ground_truth is not None`，空列表也推进 round、保持水位。"""
+    import touchstone.learning_loop as LL
+    # round=4 → 4%4==0 周期性全量；build_ground_truth 返回 []（窗口内无信号 PR）
+    wm_path = tmp_path / "wm.json"
+    LL._write_watermark(str(wm_path), 100, 4)
+    monkeypatch.setattr(LL, "build_ground_truth", lambda *a, **k: [])
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("TOUCHSTONE_INCREMENTAL", "true")
+    LL.main(["--build-ground-truth", "--ground-truth", str(tmp_path / "gt.json"),
+             "--store", str(tmp_path / "store.json"),
+             "--watermark", str(wm_path),
+             "--output", str(tmp_path / "report.json")])
+    # round 必须推进到 5（脱离周期性全量边界）；水位保持 100（无新条目，不前进也不回退）
+    assert LL._read_watermark(str(wm_path)) == {"watermark": 100, "round": 5}
+
+
+def test_build_ground_truth_since_pr_all_filtered_returns_empty(monkeypatch):
+    """PRA round-2（ground_truth.py:2615 "Add tests for edge cases"）：since_pr 指向的 PR
+    不在返回窗口内（所有返回 PR 的 number 均 <= since_pr）→ 全部被过滤 → 返回 [] 且无 per-PR
+    取数副作用。证水位有效但本轮无新 PR 时，调用方拿到空列表（非异常），下游水位逻辑正确处理。"""
+    calls = []
+
+    def fake_gh_get(url, token, **kw):
+        calls.append(url)
+        if "state=closed" in url:                          # PR 列表：全部 <= since_pr=200
+            return [{"number": 100}, {"number": 150}, {"number": 200}]
+        return []
+
+    monkeypatch.setattr(GT, "_gh_get", fake_gh_get)
+    monkeypatch.setenv("TOUCHSTONE_BOT_LOGIN", "github-actions[bot]")
+    out = GT.build_ground_truth("o", "r", "tok", window=10, since_pr=200)
+    # 全部 number<=200 被过滤 → 空列表（无异常）
+    assert out == []
+    # 不该有任何 per-PR 取数（全部在列表阶段过滤）
+    assert not [u for u in calls if "/issues/" in u]
+
+
+def test_watermark_bootstraps_on_first_run(monkeypatch, tmp_path):
+    """PRA round-3（learning_loop.py:273/233 "bootstrap"）：首轮水位文件不存在 → wm_state=None，
+    旧写块门控 `wm_state is not None` 跳过 → 文件永不创建 → 增量特性永不激活（每轮都 first）。
+    修复：门控改 wm_active（= wm_path + build_gt + 增量开），首轮 wm_state=None 也 bootstrap
+    写出水位（old_wm/round 取 0）。"""
+    import touchstone.learning_loop as LL
+    wm_path = tmp_path / "wm.json"               # 不存在 → 模拟首次运行
+    monkeypatch.setattr(LL, "build_ground_truth",
+                        lambda *a, **k: [{"pr_id": 50}, {"pr_id": 60}])
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("TOUCHSTONE_INCREMENTAL", "true")
+    LL.main(["--build-ground-truth", "--ground-truth", str(tmp_path / "gt.json"),
+             "--store", str(tmp_path / "store.json"),
+             "--watermark", str(wm_path),
+             "--output", str(tmp_path / "report.json")])
+    # 首轮必须 bootstrap 写出水位文件（旧代码此处不写 → 增量永不激活）
+    assert wm_path.exists()
+    assert LL._read_watermark(str(wm_path)) == {"watermark": 60, "round": 1}
+
+
+def test_converged_types_requires_all_active_exps_stable(monkeypatch):
+    """PRA round-3（experience_store.py:606 "Lossy Normalization"）：同 finding_type 下两条
+    active 经验（不同 text），仅一条 stable 时，converged_types 不应收入该 type——否则 distill
+    skip_types 会跳过整 type，丢失非 stable 兄弟的候选蒸馏。旧实现"≥1 stable 即收入"会 conflate。"""
+    monkeypatch.setenv("TOUCHSTONE_CONVERGENCE", "true")
+    stable_exp = _active_text_exp("PRA-DUP", "advice A")
+    stable_exp["convergence"] = {"state": "stable", "stable_rounds": 3}
+    evolving_exp = _active_text_exp("PRA-DUP", "advice B")          # 同 type 不同 text
+    evolving_exp["convergence"] = {"state": None, "stable_rounds": 1}
+    store = {"experiences": [stable_exp, evolving_exp]}
+    # 仅一条 stable → 不得收入（仍有兄弟在演化）
+    assert L.converged_types(store) == set()
+    # 两条都 stable 才收入
+    evolving_exp["convergence"]["state"] = "stable"
+    assert L.converged_types(store) == {"PRA-DUP"}
+
+
+# ---------------- 差距2a 跨 PR 一致性 ----------------
+
+def test_filter_by_consistency_default_no_filter():
+    """默认 min_source_prs=1、max_var=None → 不过滤（零行为变化）。"""
+    acc = {"a": {"id": "a", "source_prs": ["1"]}, "b": {"id": "b", "source_prs": ["1", "2"]}}
+    rh = {"a": {"1": 0.9}, "b": {"1": 0.9, "2": 0.1}}
+    out = L._filter_by_consistency(acc, rh, min_source_prs=None, max_reward_var=None)
+    assert len(out) == 2                         # 默认不过滤
+
+
+def test_filter_by_consistency_drops_single_pr_outlier():
+    """min_source_prs=2：仅 1 PR 的 candidate 被丢（运气非能力）。"""
+    acc = {"a": {"id": "a", "source_prs": ["1"]}, "b": {"id": "b", "source_prs": ["1", "2"]}}
+    rh = {"a": {"1": 0.9}, "b": {"1": 0.8, "2": 0.7}}
+    out = L._filter_by_consistency(acc, rh, min_source_prs=2, max_reward_var=None)
+    ids = {c["id"] for c in out}
+    assert ids == {"b"}                          # a 仅 1 PR → 丢
+
+
+def test_filter_by_consistency_drops_high_variance():
+    """max_reward_var=0.10：跨 PR reward 方差大的 candidate 被丢（不一致）。"""
+    acc = {"consistent": {"id": "consistent", "source_prs": ["1", "2"]},
+           "erratic": {"id": "erratic", "source_prs": ["1", "2"]}}
+    rh = {"consistent": {"1": 0.80, "2": 0.75},   # var 小
+          "erratic": {"1": 0.95, "2": 0.10}}      # var 大（0.95 vs 0.10）
+    out = L._filter_by_consistency(acc, rh, min_source_prs=1, max_reward_var=0.10)
+    ids = {c["id"] for c in out}
+    assert ids == {"consistent"}                 # erratic 方差大 → 丢
+
+
+def test_filter_by_consistency_single_pr_zero_variance_passes():
+    """PRA round-1/2：仅 1 PR 的 candidate，pvariance([single])≡0，自然 ≤ max_var 必留——
+    不是"绕过方差检查"，是方差对单点无信息量（单点无离散度可言）。其证据充分性由
+    min_source_prs 管。故 1 PR + min=1 + var=0.01 → 留（pvariance=0 ≤ 0.01）。"""
+    acc = {"a": {"id": "a", "source_prs": ["1"]}}
+    rh = {"a": {"1": 0.5}}
+    out = L._filter_by_consistency(acc, rh, min_source_prs=1, max_reward_var=0.01)
+    assert len(out) == 1                         # 1 PR + min=1 → 留（pvariance=0 ≤ 0.01）
+
+
+def test_distill_max_reward_var_env_parsing(monkeypatch):
+    monkeypatch.delenv("TOUCHSTONE_DISTILL_MAX_REWARD_VAR", raising=False)
+    assert L._distill_max_reward_var() is None    # 未设 → None（不检查）
+    monkeypatch.setenv("TOUCHSTONE_DISTILL_MAX_REWARD_VAR", "0.15")
+    assert L._distill_max_reward_var() == 0.15
+    monkeypatch.setenv("TOUCHSTONE_DISTILL_MAX_REWARD_VAR", "not-a-number")
+    assert L._distill_max_reward_var() is None    # 非法 → None
+    monkeypatch.setenv("TOUCHSTONE_DISTILL_MAX_REWARD_VAR", "-1")
+    assert L._distill_max_reward_var() is None    # 负 → None
+
+
+def test_distill_min_source_prs_env_parsing(monkeypatch):
+    """PRA round-4（distill.py:34 "Float 字符串静默回退"）：int("2.0") 抛 ValueError 会让
+    TOUCHSTONE_DISTILL_MIN_SOURCE_PRS=2.0 悄悄退默认值 1。int(float(...)) 兜底解析。"""
+    monkeypatch.delenv("TOUCHSTONE_DISTILL_MIN_SOURCE_PRS", raising=False)
+    assert L._distill_min_source_prs() == 1          # 未设 → 默认 1
+    monkeypatch.setenv("TOUCHSTONE_DISTILL_MIN_SOURCE_PRS", "3")
+    assert L._distill_min_source_prs() == 3          # 整数串
+    monkeypatch.setenv("TOUCHSTONE_DISTILL_MIN_SOURCE_PRS", "2.0")
+    assert L._distill_min_source_prs() == 2          # float 串 → int(float())=2（不再静默退 1）
+    monkeypatch.setenv("TOUCHSTONE_DISTILL_MIN_SOURCE_PRS", "not-a-number")
+    assert L._distill_min_source_prs() == 1          # 非法 → 默认
+    monkeypatch.setenv("TOUCHSTONE_DISTILL_MIN_SOURCE_PRS", "0")
+    assert L._distill_min_source_prs() == 1          # 非正 → 默认（不限）
+    monkeypatch.setenv("TOUCHSTONE_DISTILL_MIN_SOURCE_PRS", "-2")
+    assert L._distill_min_source_prs() == 1          # 负 → 默认
+
+
+def test_filter_by_consistency_min_source_prs_none_honors_env(monkeypatch):
+    """PRA round-4（distill.py:595 "Silent override"）：min_source_prs=None 应与 max_reward_var=None
+    对称——回退 env reader，而非常量 DEFAULT。直接调 _distill_via_llm(min_source_prs=None) 时
+    env 覆盖须生效。env 未设 → _distill_min_source_prs()=DEFAULT(1)，默认零行为变化。"""
+    monkeypatch.setenv("TOUCHSTONE_DISTILL_MIN_SOURCE_PRS", "3")
+    # min_source_prs=None → 回退 env reader → 3：acc 中 2-PR candidate 应被丢（< 3）
+    acc = {"few": {"id": "few", "source_prs": ["1", "2"]},
+           "many": {"id": "many", "source_prs": ["1", "2", "3", "4"]}}
+    rh = {cid: {p: 0.5 for p in c["source_prs"]} for cid, c in acc.items()}
+    out = L._filter_by_consistency(acc, rh, min_source_prs=None, max_reward_var=None)
+    ids = {c["id"] for c in out}
+    assert ids == {"many"}                          # few(2 PRs) < 3 → 丢；env 被尊重（非 DEFAULT 1）
+
+
+def test_filter_drops_no_reward_history_when_variance_active():
+    """PRA round-5（distill.py:603/579）：max_var 启用但 rh 空（rewards 未录 / score 返空 /
+    pr_id 缺失）时 _pvariance([])=0.0 恒 ≤ max_var 会静默放行无证据候选。fail-closed：丢弃。"""
+    # many 有 4 source_prs 但 rh 空（reward 全未录）→ max_var 启用时必丢（无一致性证据）
+    acc = {"many": {"id": "many", "source_prs": ["1", "2", "3", "4"]}}
+    rh = {}                                         # 空：无 reward 记录
+    out = L._filter_by_consistency(acc, rh, min_source_prs=1, max_reward_var=0.1)
+    assert out == []                                # rh 空 + max_var 启用 → fail-closed 丢
+
+
+def test_filter_keeps_no_reward_history_when_variance_off():
+    """对照：max_var=None（默认关）时 rh 空仍放行——默认零行为变化（仅 min_sp 样本量闸生效）。"""
+    acc = {"many": {"id": "many", "source_prs": ["1", "2"]}}
+    rh = {}
+    out = L._filter_by_consistency(acc, rh, min_source_prs=1, max_reward_var=None)
+    ids = {c["id"] for c in out}
+    assert ids == {"many"}                          # max_var 关 → 不要求 reward 证据
+
+
+def test_reward_hist_skips_missing_pr_id(monkeypatch):
+    """PRA round-5（distill.py:None 'Guard against missing pr_id'）：pr_id 缺失时 str(None)="None"
+    会把多个无 id PR 的奖励合并到同一 key，污染方差。_distill_via_llm 对 pr_id 缺失的 PR 跳过
+    reward 记录。验法：两 pr_id=None 的 PR 产同一 candidate——守护后 rh 空 → max_var 启用时
+    fail-closed 丢弃（若无守护，"None" key 合并写入 → rh 非空 → pvariance=0 → 放行）。"""
+    monkeypatch.setenv("TOUCHSTONE_DISTILL_MAX_REWARD_VAR", "0.1")
+
+    def my_rollout(pr, E, llm, G):
+        return [[{"finding_type": "PRA-Z"}]]
+
+    def my_score(review, adopted):
+        return 1.0
+
+    def my_distill(pr, group, llm, repo, stack):
+        return [{"id": "emphasize:PRA-Z", "finding_type": "PRA-Z", "kind": "emphasize",
+                 "text": "x", "evidence": {}, "status": "candidate",
+                 "source_prs": [pr.get("pr_id")], "repo": repo, "stack": stack,
+                 "created_at": 0, "updated_at": 0}]
+
+    # 两 pr_id=None 的 PR 产同一 candidate
+    gt = [{"pr_id": None, "human_adopted": ["PRA-Z"], "repo": "o/r", "stack": "py"},
+          {"pr_id": None, "human_adopted": ["PRA-Z"], "repo": "o/r", "stack": "py"}]
+    out = L._distill_via_llm(gt, {"experiences": []}, llm=lambda m: "[]",
+                             rollout=my_rollout, score=my_score, distill_advantage=my_distill,
+                             max_reward_var=0.1)
+    # pr_id 缺失被跳过 → reward_hist 空 → fail-closed 丢弃（无 "None" key 合并污染）
+    assert out == []                                # 守护生效：不写 "None" key，rh 空，被丢
+
+
+# ---------------- 差距3b 差分时序 + 趋势回滚 ----------------
+
+def test_differential_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("TOUCHSTONE_DIFFERENTIAL_METRICS", raising=False)
+    assert L._differential_enabled() is False
+    assert L._auto_rollback_m() == 2          # 默认值仍可读（只是 main 不调用）
+
+
+def test_append_lift_history_appends_per_type(monkeypatch):
+    monkeypatch.setenv("TOUCHSTONE_DIFFERENTIAL_METRICS", "true")
+    trend = {}
+    ab = _ab("PRA-X", with_seen=20, with_adopted=10, without_seen=20, without_adopted=4)   # lift=0.30
+    L.append_lift_history(trend, ab, ts=1000)
+    assert len(trend["PRA-X"]) == 1
+    e = trend["PRA-X"][0]
+    assert e["lift"] == 0.3 and e["ts"] == 1000
+    assert e["with_seen"] == 20 and e["without_adopted"] == 4
+    # 第二轮 → 两条
+    L.append_lift_history(trend, ab, ts=2000)
+    assert len(trend["PRA-X"]) == 2
+
+
+def test_append_lift_history_records_insufficient_samples_with_null_lift(monkeypatch):
+    """PRA round-2（experience_store.py:659）：样本不足（with_seen<min）的类型仍记录条目
+    （lift=null + 计数），让运维可区分"样本不足"与"type 缺失"。_is_declining 对 tail 含 None
+    返回 False，故 null 条目不污染趋势判定。"""
+    monkeypatch.setenv("TOUCHSTONE_DIFFERENTIAL_METRICS", "true")
+    trend = {}
+    ab_thin = _ab("PRA-X", with_seen=1, with_adopted=1, without_seen=20, without_adopted=4)   # with<min
+    L.append_lift_history(trend, ab_thin)
+    assert "PRA-X" in trend                   # 仍记录（非跳过）
+    e = trend["PRA-X"][0]
+    assert e["lift"] is None                  # 样本不足 → lift=null（非丢弃）
+    assert e["with_seen"] == 1 and e["without_seen"] == 20    # 计数保留（可见性）
+
+
+def test_append_lift_history_caps_max_history(monkeypatch):
+    monkeypatch.setenv("TOUCHSTONE_DIFFERENTIAL_METRICS", "true")
+    trend = {}
+    ab = _ab("PRA-X", with_seen=20, with_adopted=10, without_seen=20, without_adopted=4)
+    for i in range(25):
+        L.append_lift_history(trend, ab, ts=i, max_history=10)
+    assert len(trend["PRA-X"]) == 10         # cap 到 10
+    assert trend["PRA-X"][0]["ts"] == 15     # FIFO 丢旧，保留最后 10 条（15..24）
+
+
+def test_is_declining_detects_monotonic_drop():
+    series = [{"lift": 0.30}, {"lift": 0.20}, {"lift": 0.10}]   # 两步各降 0.10 > drift
+    assert L._is_declining(series, m=2, drift=0.05) is True
+    # 数据不足（< m+1 条）
+    assert L._is_declining(series[:-1], m=2, drift=0.05) is False
+
+
+def test_is_declining_noise_below_drift_does_not_trigger():
+    # 每步降幅 0.02 < drift 0.05 → 噪声，不算趋势下降
+    series = [{"lift": 0.30}, {"lift": 0.28}, {"lift": 0.26}]
+    assert L._is_declining(series, m=2, drift=0.05) is False
+
+
+def test_is_declining_non_positive_m_returns_false():
+    """PRA round-8（experience_store.py:None "non-positive m"）：m<=0 时 range(m)=[] → all([])=True
+    （空真值）——语义错误（"0 步下降"应为 False）。显式 m<=0 → False，不依赖调用方守卫。
+    retire_on_lift_decline 的 m_decline<=0 守卫在生产中阻此路径，但函数须自洽。"""
+    series = [{"lift": 0.30}, {"lift": 0.20}, {"lift": 0.10}]   # 正常下降序列
+    assert L._is_declining(series, m=0, drift=0.05) is False      # m=0 → False（非空真值 True）
+    assert L._is_declining(series, m=-1, drift=0.05) is False     # m<0 → False
+    assert L._is_declining(series, m=-2, drift=0.05) is False
+
+
+def test_retire_on_lift_decline_retires_declining_active(monkeypatch):
+    monkeypatch.setenv("TOUCHSTONE_AUTO_ROLLBACK_M", "2")
+    store = {"experiences": [_active_text_exp("PRA-X", "t")]}
+    # 时序：0.30 → 0.20 → 0.10（两步各降 0.10 > drift）→ 触发
+    trend = {"PRA-X": [{"lift": 0.30}, {"lift": 0.20}, {"lift": 0.10}]}
+    retired = L.retire_on_lift_decline(store, trend, drift=0.05)
+    assert retired == ["emphasize:PRA-X"]
+    e = store["experiences"][0]
+    assert e["status"] == "retired"
+    assert e["evidence"]["rollback_reason"] == "auto_rollback_lift_decline"
+    assert e["evidence"]["lift_trace"] == [0.3, 0.2, 0.1]
+
+
+def test_retire_on_lift_decline_skips_when_not_declining(monkeypatch):
+    monkeypatch.setenv("TOUCHSTONE_AUTO_ROLLBACK_M", "2")
+    store = {"experiences": [_active_text_exp("PRA-X", "t")]}
+    # 时序上升 → 不退役
+    trend = {"PRA-X": [{"lift": 0.10}, {"lift": 0.20}, {"lift": 0.30}]}
+    assert L.retire_on_lift_decline(store, trend, drift=0.05) == []
+    assert store["experiences"][0]["status"] == "active"
+
+
+def test_retire_on_lift_decline_skips_locked_and_human(monkeypatch):
+    monkeypatch.setenv("TOUCHSTONE_AUTO_ROLLBACK_M", "2")
+    trend = {"PRA-X": [{"lift": 0.30}, {"lift": 0.20}, {"lift": 0.10}]}
+    locked_exp = _active_text_exp("PRA-X", "locked text", eid="locked")
+    locked_exp["locked"] = True                                  # 真 locked → 不动
+    store = {"experiences": [
+        locked_exp,
+        {"id": "human", "finding_type": "PRA-X", "kind": "emphasize", "text": "h",
+         "status": "active", "locked": False, "source": "human",                 # 人手 seed → 不动
+         "source_prs": [], "evidence": {}}]}
+    assert L.retire_on_lift_decline(store, trend, drift=0.05) == []
+    assert all(e["status"] == "active" for e in store["experiences"])
+
+
+def test_retire_on_lift_decline_disabled_when_m_zero(monkeypatch):
+    monkeypatch.setenv("TOUCHSTONE_AUTO_ROLLBACK_M", "0")
+    store = {"experiences": [_active_text_exp("PRA-X", "t")]}
+    trend = {"PRA-X": [{"lift": 0.30}, {"lift": 0.20}, {"lift": 0.10}]}
+    assert L.retire_on_lift_decline(store, trend) == []      # m=0 → 趋势闸关
+    assert store["experiences"][0]["status"] == "active"
+
+
+def test_trend_not_written_when_differential_off(monkeypatch, tmp_path):
+    """PRA round-1 回归（learning_loop.py:431）：--trend 传入但 TOUCHSTONE_DIFFERENTIAL_METRICS
+    关（默认）时，trend 恒 None（line 275 init；line 276 门控 `_differential_enabled() and trend_path`
+    不入），line 431 `if trend is not None and trend_path` 跳过 → 不写空/None 文件。锁此不变式。"""
+    import touchstone.learning_loop as LL
+    monkeypatch.delenv("TOUCHSTONE_DIFFERENTIAL_METRICS", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    trend_path = tmp_path / "adoption-trend.json"
+    LL.main(["--store", str(tmp_path / "store.json"),
+             "--trend", str(trend_path),
+             "--output", str(tmp_path / "report.json")])
+    assert not trend_path.exists()              # 差分关 → 不落 trend 文件（trend=None 被 431 守卫挡）
+
+
+def test_trend_written_when_differential_on(monkeypatch, tmp_path):
+    """TOUCHSTONE_DIFFERENTIAL_METRICS=true + 有 ab 数据 → trend 文件写出且含 per-type 条目（非空 {}）。
+    PRA round-3（tests/test_learning_loop.py:2767）：强化断言覆盖门控回归（如 `if trend_path:` 误替
+    `if _differential_enabled() and trend_path:` 时，仅验"文件存在"仍过——现验数据端到端流通）。"""
+    import touchstone.learning_loop as LL
+    monkeypatch.setenv("TOUCHSTONE_DIFFERENTIAL_METRICS", "true")
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    # mock build_ground_truth 返回非空（触发 aggregate_ab 路径）+ aggregate_ab 返回已知 {ftype: arm}
+    # （_ab 已返回 {ftype: arm} 嵌套结构；此处显式展开，避免对 _ab 返回形状的误读）
+    monkeypatch.setattr(LL, "build_ground_truth", lambda *a, **k: [{"pr_id": 1}])
+    monkeypatch.setattr(LL, "aggregate_ab", lambda gt: {
+        "PRA-X": {"with_seen": 20, "with_adopted": 10, "without_seen": 20, "without_adopted": 4}})
+    trend_path = tmp_path / "adoption-trend.json"
+    LL.main(["--build-ground-truth", "--ground-truth", str(tmp_path / "gt.json"),
+             "--store", str(tmp_path / "store.json"),
+             "--trend", str(trend_path),
+             "--output", str(tmp_path / "report.json")])
+    assert trend_path.exists()
+    import json
+    data = json.loads(trend_path.read_text())
+    assert isinstance(data, dict)
+    assert "PRA-X" in data                        # ab 数据流通 → 有 per-type 条目（非空 {}）
+    assert data["PRA-X"][0]["lift"] == 0.3        # 10/20 - 4/20 = 0.3
+    assert data["PRA-X"][0]["with_seen"] == 20
+
+
+def test_trend_bare_relative_path_writes_to_cwd(monkeypatch, tmp_path):
+    """PRA round-6（learning_loop.py:474 "cwd-sensitive path"）：--trend 传裸文件名（无目录分量）
+    时 `os.path.dirname→''`，`or '.'` 回落到 CWD。锁此语义：相对路径 → CWD 落盘，未来重构不得静默
+    改变文件位置。`os.makedirs('.', exist_ok=True)` 是安全 no-op（不会失败）；落盘位置由调用方传的
+    相对路径决定（learn.yml 用 data/adoption-trend.json 有目录分量，走另一分支）。"""
+    import os
+    import touchstone.learning_loop as LL
+    monkeypatch.setenv("TOUCHSTONE_DIFFERENTIAL_METRICS", "true")
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(LL, "build_ground_truth", lambda *a, **k: [{"pr_id": 1}])
+    monkeypatch.setattr(LL, "aggregate_ab", lambda gt: {
+        "PRA-X": {"with_seen": 20, "with_adopted": 10, "without_seen": 20, "without_adopted": 4}})
+    # 切到隔离 CWD：裸相对名 → 必落在该 CWD（证明 dirname='' → '.' 回落语义端到端成立）
+    monkeypatch.chdir(tmp_path)
+    LL.main(["--build-ground-truth", "--ground-truth", str(tmp_path / "gt.json"),
+             "--store", str(tmp_path / "store.json"),
+             "--trend", "adoption-trend.json",        # 裸文件名（无目录分量）
+             "--output", str(tmp_path / "report.json")])
+    import json
+    written = tmp_path / "adoption-trend.json"          # 落在 CWD（=tmp_path）
+    assert written.exists()
+    data = json.loads(written.read_text())
+    assert "PRA-X" in data
+
+
+def test_append_lift_history_max_history_zero_or_negative_means_uncapped(monkeypatch):
+    """PRA round-6（experience_store.py:680 "zero max_history silently dropping types"）：
+    评审担心 max_history=0 丢整个 type——证伪：Python `[-0:]≡[0:]` 本保留全部。但负值 `[-(-1):]=[1:]`
+    确误丢首条（真 bug）。硬化：<=0 统一=不限（与 0 现状一致 + 修复负值）。0/负均保留全部条目。"""
+    monkeypatch.setenv("TOUCHSTONE_DIFFERENTIAL_METRICS", "true")
+    ab = _ab("PRA-X", with_seen=20, with_adopted=10, without_seen=20, without_adopted=4)
+    for mh in (0, -1, -5):
+        trend = {}
+        for i in range(5):
+            L.append_lift_history(trend, ab, ts=i, max_history=mh)
+        # <=0 视为不限 → 5 条全保留（不被封顶/不丢首条）
+        assert len(trend["PRA-X"]) == 5, f"max_history={mh} 应不限，实际 {len(trend['PRA-X'])}"
+    # 对照：max_history=2 封顶到 2（正路径不受影响）
+    trend = {}
+    for i in range(5):
+        L.append_lift_history(trend, ab, ts=i, max_history=2)
+    assert len(trend["PRA-X"]) == 2

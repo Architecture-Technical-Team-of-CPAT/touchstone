@@ -65,10 +65,43 @@ jobs:
           TOUCHSTONE_PROTECTED_TYPES: ${{ vars.TOUCHSTONE_PROTECTED_TYPES || '' }}
           TOUCHSTONE_LEARNING_ENABLED: ${{ vars.TOUCHSTONE_LEARNING_ENABLED || 'true' }}
           TOUCHSTONE_GROUND_TRUTH_MIN: ${{ vars.TOUCHSTONE_GROUND_TRUTH_MIN || '10' }}
+          # 类型白名单（c1：防 LLM 幻觉 finding_type 污染经验库）。默认关=现状不变：_resolve_taxonomy
+          # 读本 env，空/未设 → taxonomy=None → merge_candidates 放行所有类型。开启前须先在
+          # TOUCHSTONE_TAXONOMY_TYPES（或 pr-agent.yaml label 集）配齐规范类型——白名单非空时未知类型
+          # fail-closed 丢弃。run #6 的 191 条里混有 LLM 幻觉型（PRA-A/B/C/OK/003…），类型表确定后置
+          # vars.TOUCHSTONE_TAXONOMY_ENFORCE=true 即开始清洗（仅影响后续新蒸馏的候选，不改存量）。
+          TOUCHSTONE_TAXONOMY_ENFORCE: ${{ vars.TOUCHSTONE_TAXONOMY_ENFORCE || '' }}
+          TOUCHSTONE_TAXONOMY_TYPES: ${{ vars.TOUCHSTONE_TAXONOMY_TYPES || '' }}
+          # 差距1a 位置级奖励（默认关=类型集合匹配=现状）。机制+数据管线+测试已就位（514f1ae）：
+          # thread_findings 带 file/line → build_ground_truth 产 resolved_findings → make_gt_entry 产
+          # human_adopted_positions → score_review 走位置级部分信用。仅留本 env 接通生产 run-path。
+          # 开 vars.TOUCHSTONE_POSITIONAL_REWARD=true 即生效；部分信用权重经 POS_PARTIAL_* 可调。
+          TOUCHSTONE_POSITIONAL_REWARD: ${{ vars.TOUCHSTONE_POSITIONAL_REWARD || '' }}
+          TOUCHSTONE_POS_PARTIAL_SAMEFILE: ${{ vars.TOUCHSTONE_POS_PARTIAL_SAMEFILE || '0.5' }}  # 同 file 行距远的部分信用
+          TOUCHSTONE_POS_PARTIAL_NOFILE: ${{ vars.TOUCHSTONE_POS_PARTIAL_NOFILE || '0.5' }}      # 无 file 可比时的部分信用
           # c3 rollout 成本控制（缓存 / 预算 / 并发；默认值同设计文档 §5.1，经 vars 可调）
           TOUCHSTONE_ROLLOUT_CACHE: ${{ vars.TOUCHSTONE_ROLLOUT_CACHE || '' }}       # 空=不缓存；'memory'=进程内；路径=文件缓存
           TOUCHSTONE_ROLLOUT_BUDGET: ${{ vars.TOUCHSTONE_ROLLOUT_BUDGET || '200' }}   # 每轮总 rollout 上限
           TOUCHSTONE_ROLLOUT_WORKERS: ${{ vars.TOUCHSTONE_ROLLOUT_WORKERS || '4' }}   # variant 批并发数
+          # 差距3a 收敛检测（默认关=全量蒸馏=现状）。开 vars.TOUCHSTONE_CONVERGENCE=true 后：连续
+          # N_STABLE 轮 text+lift 不变的 active 经验标 stable，下轮蒸馏跳过该 type。vars 可调阈值。
+          TOUCHSTONE_CONVERGENCE: ${{ vars.TOUCHSTONE_CONVERGENCE || '' }}
+          TOUCHSTONE_CONVERGE_N_STABLE: ${{ vars.TOUCHSTONE_CONVERGE_N_STABLE || '3' }}
+          TOUCHSTONE_CONVERGE_LIFT_DRIFT: ${{ vars.TOUCHSTONE_CONVERGE_LIFT_DRIFT || '0.05' }}
+          # 差距3b 增量水位（默认关=全量重建=现状）。开 vars.TOUCHSTONE_INCREMENTAL=true 后：只取数
+          # number>水位 的新 PR（省 per-PR ~5 次 API 调用）；每 FULL_REFRESH_EVERY 轮强制全量对账兜底漂移。
+          TOUCHSTONE_INCREMENTAL: ${{ vars.TOUCHSTONE_INCREMENTAL || '' }}
+          TOUCHSTONE_FULL_REFRESH_EVERY: ${{ vars.TOUCHSTONE_FULL_REFRESH_EVERY || '4' }}
+          # 差距2a 跨 PR 一致性（默认关=现状）。candidate 入池前要求来自≥N 个 PR 且跨 PR reward 方差小
+          # （防"仅 1 PR 高 reward"的运气型 outlier 污染经验库）。默认 MIN=1（不限）、MAX_VAR 空（不检查）。
+          TOUCHSTONE_DISTILL_MIN_SOURCE_PRS: ${{ vars.TOUCHSTONE_DISTILL_MIN_SOURCE_PRS || '1' }}
+          TOUCHSTONE_DISTILL_MAX_REWARD_VAR: ${{ vars.TOUCHSTONE_DISTILL_MAX_REWARD_VAR || '' }}
+          # 差距3b 差分时序 + 趋势回滚（默认关=现状）。开 vars.TOUCHSTONE_DIFFERENTIAL_METRICS=true 后：
+          # 每轮 per-type lift 追加到 adoption-trend.json（时序可观测）；active 经验 lift 连续 AUTO_ROLLBACK_M
+          # 轮下降 → 趋势退役（与 retire_on_negative_lift 静态阈值互补，提前下线慢性恶化经验）。
+          TOUCHSTONE_DIFFERENTIAL_METRICS: ${{ vars.TOUCHSTONE_DIFFERENTIAL_METRICS || '' }}
+          TOUCHSTONE_AUTO_ROLLBACK_M: ${{ vars.TOUCHSTONE_AUTO_ROLLBACK_M || '2' }}
+          TOUCHSTONE_TREND_MAX_HISTORY: ${{ vars.TOUCHSTONE_TREND_MAX_HISTORY || '20' }}
           FORCE_REBUILD: ${{ github.event.inputs.force_ground_truth_rebuild || 'false' }}
         run: |
           python -m touchstone.learning_loop \
@@ -76,6 +109,8 @@ jobs:
             --build-ground-truth \
             --ground-truth data/ground_truth.json \
             --calib-agg calibration.json \
+            --watermark data/learn_watermark.json \
+            --trend data/adoption-trend.json \
             --output data/learning_report.json
 
       - name: Push experience update to bot branch + open PR
@@ -91,7 +126,16 @@ jobs:
           git config user.email "touchstone-bot@users.noreply.github.com"
           BOT_BRANCH="bot/experience-update"
           git checkout -B "$BOT_BRANCH"
-          git add data/experience_store.json data/ground_truth.json
+          # PRA round-2（learn.yml:122 "Assert mandatory outputs exist before committing"）：
+          # experience_store.json 是 save_store 恒产——缺失即 learn 异常静默退出。若仍按存在性
+          # add，会漏掉这个关键产物而提交空 commit（误报"经验已更新"）。强制断言：缺失即显式失败。
+          [ -f data/experience_store.json ] || { echo "::error::data/experience_store.json 缺失：learn 异常未产出主产物，拒绝空提交"; exit 1; }
+          git add data/experience_store.json
+          # 可选产物按存在性 add（ground_truth 取决于 --build-ground-truth；learn_watermark 仅
+          # TOUCHSTONE_INCREMENTAL=true 时写；adoption-trend 仅 TOUCHSTONE_DIFFERENTIAL_METRICS=true 时写）。
+          for f in data/ground_truth.json data/learn_watermark.json data/adoption-trend.json; do
+            [ -f "$f" ] && git add "$f"
+          done
           # 不加 [skip ci]：要让 touchstone 评审在此 PR 上跑，gate 绿才触发自动合入
           git commit -m "chore(bot): weekly experience store + ground truth update" || { echo "无改动"; exit 0; }
           # 滚动分支：force-push 覆盖上一轮未合残留（learn.yml 有 concurrency 组，无并发）
