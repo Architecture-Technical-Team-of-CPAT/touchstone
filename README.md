@@ -108,6 +108,14 @@ permissions:
   pull-requests: write
   checks: write
 
+env:
+  # 引擎版本单一来源。三选一：
+  #   latest  → 自动跟最新 release tag（零摩擦跟 patch；breaking change 有 schema_version 告警兜底）
+  #   v0.2.2  → 钉具体 tag（可复现，升级时手动改这一行）
+  #   main    → 追主干（最激进，不推荐生产用）
+  TOUCHSTONE_ENGINE_REPO: "Architecture-Technical-Team-of-CPAT/touchstone"
+  TOUCHSTONE_ENGINE_REF: "latest"
+
 jobs:
   touchstone:
     runs-on: ubuntu-latest
@@ -116,6 +124,17 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 0
+      - name: Resolve engine ref（latest → 最新 release tag；具体 tag/main 原样透传）
+        id: tsref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REF="${TOUCHSTONE_ENGINE_REF}"
+          if [ "$REF" = "latest" ]; then
+            REF=$(gh release view --repo "${TOUCHSTONE_ENGINE_REPO}" --json tagName --jq .tagName)
+          fi
+          [ -n "$REF" ] || { echo "::error::resolve engine ref 失败（TOUCHSTONE_ENGINE_REF=${TOUCHSTONE_ENGINE_REF}，检查 GH_TOKEN 权限 / ${TOUCHSTONE_ENGINE_REPO} 是否有 release）"; exit 1; }
+          echo "resolved=$REF" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -128,8 +147,8 @@ jobs:
       - name: Checkout Touchstone
         uses: actions/checkout@v4
         with:
-          repository: Architecture-Technical-Team-of-CPAT/touchstone
-          ref: v0.1.0                      # 锁定版本
+          repository: ${{ env.TOUCHSTONE_ENGINE_REPO }}
+          ref: ${{ steps.tsref.outputs.resolved }}
           path: .touchstone-src
       - name: Run review
         env:
@@ -144,7 +163,13 @@ jobs:
           cd .touchstone-src && python -m touchstone.orchestrator
 ```
 
-你的仓库不需要任何 Touchstone 代码——版本由 `ref: v1` 锁定。
+你的仓库不需要任何 Touchstone 代码——版本由顶部 `TOUCHSTONE_ENGINE_REF` 决定：
+
+| 值 | 行为 | 适用 |
+|---|---|---|
+| `latest` | 自动解析为最新 release tag（默认） | 日常零摩擦跟 patch；若拉到改了 pr.yaml 字段的版本，引擎运行时会 stderr 告警 |
+| `v0.2.2` | 钉具体 tag | 要求可复现；升级手动改这一行 |
+| `main` | 追主干 | 实验性，不推荐生产 |
 
 **Step 2**：配置 Secrets（Settings → Secrets and variables → Actions → New repository secret）:
 

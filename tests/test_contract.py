@@ -264,3 +264,24 @@ def test_parse_diff_fully_deleted_file_not_captured():
             "@@ -1,1 +0,0 @@\n-was here\n")
     files, _ = cc.parse_diff(diff)
     assert "gone.py" not in files
+
+
+# ---------------- schema_version 兼容性告警 ----------------
+def test_schema_version_constant_decoupled_from_software_version():
+    """SCHEMA_VERSION 标记 pr.yaml 字段结构版本，与 touchstone 软件版本（__version__）正交。
+    软件已发多版、schema 一直是 0.1——字段结构没变。改字段定义时才 bump。"""
+    assert cc.SCHEMA_VERSION == "0.1"
+
+
+def test_schema_version_warning_silent_when_matches_or_missing():
+    """缺失（旧 yaml 无此字段）或匹配当前 schema → 无告警（向前兼容）。"""
+    assert cc.schema_version_warning({}) is None                     # 缺失
+    assert cc.schema_version_warning({"schema_version": "0.1"}) is None   # 匹配
+
+
+def test_schema_version_warning_when_mismatch():
+    """未知 schema_version（未来字段变更后）→ 告警串，提示升级 engine 或改回已知版本。"""
+    w = cc.schema_version_warning({"schema_version": "0.2"})
+    assert w is not None
+    assert "'0.2'" in w and "'0.1'" in w
+    assert "TOUCHSTONE_ENGINE_REF" in w                              # 指向升级路径

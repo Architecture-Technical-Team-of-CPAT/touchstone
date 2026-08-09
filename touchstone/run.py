@@ -21,6 +21,7 @@ import tempfile
 from urllib.parse import urlparse
 
 from touchstone import orchestrator as C   # 触发 orchestrator.py 的同目录加固导入
+from touchstone import contract_check      # schema_version_warning（契约层职责）
 
 
 def _gh_host():
@@ -99,6 +100,11 @@ def main():
             sys.exit(f"未找到规范 {std_path}（用 --standards 指定你自己的）")
         rule_index = {r["id"]: r for r in standards.get("rules", [])}
         contract = C.load_yaml(os.path.join(repo_dir, ".touchstone/pr.yaml"))
+        # schema_version 兼容性告警（pr.yaml 字段结构版本，与软件版本正交）：
+        # 不匹配只告警不阻断——engine 版本与配置 schema 错配不是契约违规，不进 findings。
+        _schema_warn = contract_check.schema_version_warning(contract)
+        if _schema_warn:
+            print(f"[warn] {_schema_warn}", file=sys.stderr)
 
         diff = C.get_pr_diff(owner, name, args.pr, token)
         pr_ctx = {"owner": owner, "repo": name, "number": args.pr, "sha": head_sha,
