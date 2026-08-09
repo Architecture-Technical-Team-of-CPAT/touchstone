@@ -65,12 +65,13 @@ def test_parse_pr_agent_strips_trailing_newlines_from_fields():
         "issue_header": "边界 off-by-one\n", "issue_content": "循环越界\n"}]}}
     it2 = RP.parse_pr_agent(raw2)[0]
     assert it2["file"] == "src/util.py" and it2["summary"] == "边界 off-by-one"
-    # 贯通到 findings：file:line 不再换行、判据 question 不带尾 \n
+    # 贯通到 findings：file:line 不再换行
     f = RP.normalize(items)[0]
     assert f["file"] == "src/auth.py" and "\n" not in f["file"]
-    q = f["done_criteria"]["spec"]["question"]
-    assert q.endswith("是否已按方向解决？")              # direction 尾 \n 已剥 → 不断行
-    assert "\n" not in q
+    # 达成判据诚实降级（见 review_provider.normalize 注释）：model 来源给不出具体复核问题，
+    # question 留空——不再用「{direction}」是否已按方向解决？模板复读。file/summary 的 \n
+    # 剥离仍由 parse_pr_agent 的 _clean_str 保证（上面已断言）。
+    assert f["done_criteria"]["spec"]["question"] == ""
 
 
 # ---------------- 归一 ----------------

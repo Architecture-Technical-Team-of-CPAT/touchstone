@@ -104,7 +104,39 @@ def test_review_source_gets_review_done_criteria():
         "issue_header": "边界未处理", "issue_content": "空输入分支缺失", "label": "possible issue"}]}}
     f = rp.normalize(rp.parse_pr_agent(raw))[0]
     assert f["done_criteria"]["kind"] == "review"
-    assert "边界未处理" in f["done_criteria"]["spec"]["question"]
+    # 诚实降级（见 review_provider.normalize 注释）：model 来源给不出具体复核问题，
+    # question 留空而非复读 direction。direction 仍在 fix_direction 字段（不丢）。
+    assert f["done_criteria"]["spec"]["question"] == ""
+    assert f["fix_direction"] == "边界未处理"           # 方向不丢，仅判据不复读
+
+
+def test_review_done_criteria_renders_honest_degradation():
+    """model 来源判据 question 留空 → 渲染诚实降级行（不套 direction 模板复读）。
+
+    设计意见 1 要求 review 类带「一句可回答的具体复核问题」（示例：回滚路径是否覆盖跨模块
+    调用失败）。normalize 层给不出 → 诚实留空。渲染层退为「下一轮复检不再命中即销项」
+    （reconcile 实际机制：sig 不再现即自动销项）。对比：确定性来源渲染「规则 X 复检不再命中」。"""
+    from touchstone.render import _finding_entry
+    # model 来源：question 空 → 诚实降级
+    f_model = {"rule_id": "PRA-X", "file": "a.py", "line": 1, "rationale": "问题",
+               "fix_direction": "方向", "fix_reasoning": "",
+               "done_criteria": {"kind": "review", "spec": {"question": ""}},
+               "severity": "warn", "confidence": 0.7, "agent": "pr-agent:review"}
+    entry = _finding_entry(1, f_model)
+    assert "下一轮复检不再命中即销项" in entry
+    assert "是否已按方向解决" not in entry             # 不复读 direction
+    # 带具体复核问题的 review（如 guard_context / 未来 prompt 工程产出）→ 渲染「需人工复核」
+    f_specific = dict(f_model, done_criteria={"kind": "review",
+                                              "spec": {"question": "回滚路径是否覆盖跨模块调用失败？"}})
+    entry2 = _finding_entry(1, f_specific)
+    assert "需人工复核：回滚路径是否覆盖跨模块调用失败？" in entry2
+    # 确定性来源不变：规则复检
+    f_det = {"rule_id": "SCOPE-001", "file": "a.py", "line": 1, "rationale": "越界",
+             "fix_direction": "收进 docs/", "fix_reasoning": "",
+             "done_criteria": {"kind": "deterministic", "spec": {"recheck": "SCOPE-001"}},
+             "severity": "warn", "confidence": 1.0, "agent": "contract-check"}
+    entry3 = _finding_entry(1, f_det)
+    assert "规则 `SCOPE-001` 复检不再命中" in entry3
 
 
 # ---------------- 意见 3：收敛清单 ----------------
@@ -113,6 +145,133 @@ def _finding(rid, file="a.py", line=1, direction="改这里", kind="deterministi
           else {"kind": "review", "spec": {"question": "解决了吗？"}})
     return {"rule_id": rid, "file": file, "line": line, "fix_direction": direction,
             "fix_reasoning": "依据", "done_criteria": dc}
+
+
+# ---------------- 借鉴 pr-agent #2510：折叠长依据 ----------------
+def _rf(rid, rationale="问题", direction="方向", reasoning="", line=1):
+    """render._finding_entry 用的最小 finding dict。"""
+    return {"rule_id": rid, "file": "a.py", "line": line, "rationale": rationale,
+            "fix_direction": direction, "fix_reasoning": reasoning,
+            "done_criteria": {"kind": "review", "spec": {"question": "?"}},
+            "severity": "warn", "confidence": 0.7, "agent": "pr-agent:review"}
+
+
+def test_short_reasoning_rendered_inline():
+    """短依据（≤200 字符）平铺不折叠——短依据是快速判读信号，折叠反而增操作。"""
+    from touchstone.render import _finding_entry
+    short = "这是一条短依据。" * 5   # ~45 字符
+    f = _rf("PRA-X", reasoning=short)
+    entry = _finding_entry(1, f)
+    assert f"   - 依据：{short}" in entry
+    assert "<details>" not in entry
+
+
+def test_long_reasoning_collapsed_into_details():
+    """长依据（>200 字符）折叠进 <details>——降低清单视觉噪声（借鉴 pr-agent #2510）。
+
+    author 一眼扫清单只看标题+方向；需要依据细节时再点开。pr-agent 上游 #2510 同样把
+    Issue description / Issue Context 放 <details> 折叠，默认只露标题 + 一句后果。"""
+    from touchstone.render import _finding_entry
+    long = "x" * 250
+    f = _rf("PRA-X", reasoning=long)
+    entry = _finding_entry(1, f)
+    assert "<details>" in entry and "</details>" in entry
+    assert f"依据（{len(long)} 字，点击展开）" in entry   # summary 露字数
+    assert long in entry                                  # 全文在 details body 内
+
+
+def test_reasoning_equal_to_rationale_not_rendered():
+    """依据与 rationale 同文时不渲染（既有去重守卫，折叠改动不破坏此不变式）。"""
+    from touchstone.render import _finding_entry
+    same = "同文" * 150                                   # rationale 与 reasoning 完全相同（>200 字符）
+    f = _rf("PRA-X", rationale=same, direction="方向", reasoning=same)
+    entry = _finding_entry(1, f)
+    assert "依据" not in entry                            # 与 rationale 同文→不渲染
+    assert "<details>" not in entry
+
+
+def test_empty_reasoning_omitted():
+    """空依据不渲染（既不显式露行也不显式露 details）。"""
+    from touchstone.render import _finding_entry
+    f = _rf("PRA-X", reasoning="")
+    entry = _finding_entry(1, f)
+    assert "依据" not in entry and "<details>" not in entry
+
+
+# ---------------- 借鉴 pr-agent #2510：字段去冗余 + 定位精度 ----------------
+def test_finding_entry_omits_direction_when_equal_to_rationale():
+    """修复方向与 rationale 同文时不复读（去字段冗余）。
+
+    pr-agent 归一化层 normalize() 对 model 来源 finding 设 rationale=fix_direction=summary，
+    此前渲染为「标题=rationale」+「修复方向：rationale」（完全重复=纯噪声）。
+    借鉴 pr-agent 上游 #2510 评审写作：标题已含一句话问题，方向同文即不再单列。"""
+    from touchstone.render import _finding_entry
+    f = {"rule_id": "PRA-X", "file": "a.py", "line": 5, "rationale": "边界未处理",
+         "fix_direction": "边界未处理", "fix_reasoning": "",
+         "done_criteria": {"kind": "review", "spec": {"question": "?"}},
+         "severity": "warn", "confidence": 0.7, "agent": "pr-agent:review"}
+    entry = _finding_entry(1, f)
+    assert entry.count("边界未处理") == 1           # 标题里出现一次，不再复读
+    assert "修复方向" not in entry                  # 同文→整行省略
+
+
+def test_finding_entry_keeps_direction_when_distinct_from_rationale():
+    """确定性来源 rationale≠fix_direction → 修复方向保留（去冗余不误杀信息）。"""
+    from touchstone.render import _finding_entry
+    f = {"rule_id": "SCOPE-001", "file": "a.py", "line": 1, "rationale": "改动越界",
+         "fix_direction": "收到 docs/ 下", "fix_reasoning": "",
+         "done_criteria": {"kind": "deterministic", "spec": {"recheck": "SCOPE-001"}},
+         "severity": "warn", "confidence": 1.0, "agent": "contract-check"}
+    entry = _finding_entry(1, f)
+    assert "修复方向：收到 docs/ 下" in entry       # 不同→保留
+
+
+def test_finding_entry_no_colon_None_when_line_missing():
+    """行号缺失时不渲染 `file:None`（定位精度）。
+
+    pr-agent review 类偶不返回 start_line → line=None → 此前 f.get('line','?') 得 None
+    （键在值 None，default 不生效）渲染 `a.py:None`。应退为只显示文件名。"""
+    from touchstone.render import _finding_entry
+    f = {"rule_id": "PRA-Y", "file": "a.py", "line": None, "rationale": "问题",
+         "fix_direction": "", "fix_reasoning": "",
+         "done_criteria": {"kind": "review", "spec": {"question": "?"}},
+         "severity": "warn", "confidence": 0.7, "agent": "pr-agent:review"}
+    entry = _finding_entry(1, f)
+    assert "a.py:None" not in entry
+    assert "`a.py`" in entry                        # 行号缺失→只显示文件名
+
+
+def test_normalize_line_falls_back_to_line_end():
+    """line_start 缺失时 line_end 回退（定位精度，数据层兜底）。
+
+    pr-agent review key_issues 偶带 end_line 不带 start_line；line=None 既丑（file:None）
+    又让 sig 塌缩到 :None 字面量、跨轮 reconcile 全靠文件名。line_end 回退让 sig 带真实行号。"""
+    raw = {"review": {"key_issues_to_review": [{
+        "relevant_file": "a.py", "end_line": 42, "start_line": None,
+        "issue_header": "X", "issue_content": "Y", "label": "possible issue"}]}}
+    f = rp.normalize(rp.parse_pr_agent(raw))[0]
+    assert f["line"] == 42                          # start 缺→用 end
+
+
+def test_normalize_line_prefers_start_when_both_present():
+    """line_start 与 line_end 都在→用 start（line_end 仅作 fallback，不替代）。"""
+    raw = {"code_suggestions": [{
+        "relevant_file": "a.py", "relevant_lines_start": 10, "relevant_lines_end": 20,
+        "one_sentence_summary": "s", "label": "Possible issue"}]}
+    f = rp.normalize(rp.parse_pr_agent(raw))[0]
+    assert f["line"] == 10
+
+
+def test_normalize_line_zero_start_not_treated_as_missing():
+    """line_start=0 不被当缺失（`is not None` 而非 `or`，与 render._location 一致）。
+
+    GitHub diff 行号 1-based，0 罕见；但 0 是 falsy，若用 `or` 会被误判缺失→错误回退
+    line_end。用 `is not None` 判定，0 作为真实行号保留。"""
+    raw = {"code_suggestions": [{
+        "relevant_file": "a.py", "relevant_lines_start": 0, "relevant_lines_end": 5,
+        "one_sentence_summary": "s", "label": "Possible issue"}]}
+    f = rp.normalize(rp.parse_pr_agent(raw))[0]
+    assert f["line"] == 0                            # 0 不当缺失，不回退 end
 
 
 def test_checklist_from_findings_all_open_and_dedup():

@@ -66,23 +66,71 @@ def render_unreliable_callout(engine_status, ai_raw_count=0, added_lines=0, engi
     ])
 
 
+def _location(f):
+    """渲染位置串——行号缺失时不显示 `:None`（借鉴 pr-agent 上游 #2510 评审的定位精度）。
+
+    pr-agent 偶不返回 relevant_lines_start（review 类 key_issues 的 start_line 缺失），
+    此前 f.get('line','?') 对 line=None 返回 None（键在但值为 None），渲染为 `file:None`——
+    既丑又让 author 误以为「行号是字面量 None」。行号缺失时只显示文件名，干净且不误导。
+
+    review_provider.normalize 已做 line_start→line_end 回退（本 PR 配套），此处是渲染侧的
+    最终兜底：两层联合保证 `:None` 永不出现在评审报告里。"""
+    file_ = f.get("file") or "?"
+    line_ = f.get("line")
+    return f"{file_}:{line_}" if line_ is not None else file_
+
+
+_REASONING_COLLAPSE_THRESHOLD = 200
+
+
+def _render_reasoning(reasoning):
+    """渲染依据字段——长文折叠进 <details>（借鉴 pr-agent 上游 #2510 的 Agent Prompt 折叠）。
+
+    pr-agent #2510 评审把详细 Issue description / Issue Context 放 <details> 折叠，默认只露
+    标题 + 一句后果，降低视觉噪声。本系统同理：依据 ≤200 字符平铺（短依据是快速判读信号），
+    超阈值折叠为「依据（点击展开）」——author 一眼扫清单时只看标题 + 方向，需要细节再展开。
+
+    纯函数：输入字符串，输出 markdown 片段（空输入返回空串）。"""
+    if not reasoning:
+        return ""
+    if len(reasoning) <= _REASONING_COLLAPSE_THRESHOLD:
+        return f"   - 依据：{reasoning}"
+    # 折叠：summary 行露字数，body 完整保留（author 需要细节时展开）。
+    # 用 f-string 而非 .format()：reasoning 含 { 或 } 时（代码片段/JSON 示例），
+    # .format(body=reasoning) 虽不解析值里的 {}（值不被二次扫描），但 .format() 调用
+    # 形态易让评审/读者误判会炸——f-string 直接内联，无此视觉歧义（评审两轮均提此点）。
+    # return 串开头不带 \n：调用方 `"\n" + _render_reasoning(...)` 已加换行，与短依据分支
+    # （`f"   - 依据：..."` 开头也无 \n）保持一致——避免折叠分支双换行（评审第三轮提）。
+    return (f"   - <details><summary>依据（{len(reasoning)} 字，点击展开）</summary>\n\n"
+            f"   {reasoning}\n\n   </details>")
+
+
 def _finding_entry(i, f):
-    """单条发现的渲染（规则命中与 AI 建议共用）：位置 — 问题 + 修复方向/依据/达成判据 + 行尾元数据。"""
+    """单条发现的渲染（规则命中与 AI 建议共用）：位置 — 问题 + 修复方向/依据/达成判据 + 行尾元数据。
+
+    字段去冗余（借鉴 pr-agent 上游 #2510 评审写作）：title 行已含 rationale（一句话问题），
+    修复方向若与 rationale 同文则不再复读（此前的「修复方向：<与标题完全相同的文字>」纯噪声）。
+    依据字段早有同等去重守卫（reasoning != rationale 才显示），本处补齐对称。"""
     direction = f.get("fix_direction") or f.get("suggested_fix") or ""
     reasoning = f.get("fix_reasoning") or ""
+    rationale = f.get("rationale") or ""
     dc = f.get("done_criteria") or {}
     _spec = dc.get("spec") or {}
     if dc.get("kind") == "deterministic":
         dc_line = f"规则 `{_spec.get('recheck', '?')}` 复检不再命中"
     elif dc.get("kind") == "review":
         q = _spec.get("question", "")
-        dc_line = f"需人工复核：{q}" if q else "定向复核通过"
+        # q 非空=有具体复核问题（设计意见 1 的复核判据，如「回滚路径是否覆盖跨模块调用失败」）；
+        # q 空=诚实降级（model 来源在 normalize 层给不出具体问题，不再用「{direction}是否已解决」
+        # 模板复读）。降级时如实描述 reconcile 实际机制：下一轮 sig 不再现即自动销项。
+        dc_line = f"需人工复核：{q}" if q else "下一轮复检不再命中即销项"
     else:
         dc_line = ""
-    e = (f"{i}. **`{f.get('file','?')}:{f.get('line','?')}`** — {f.get('rationale','')}\n"
-         f"   - 修复方向：{direction}")
-    if reasoning and reasoning != f.get("rationale"):
-        e += f"\n   - 依据：{reasoning}"
+    e = f"{i}. **`{_location(f)}`** — {rationale}"
+    if direction and direction != rationale:
+        e += f"\n   - 修复方向：{direction}"
+    if reasoning and reasoning != rationale:
+        e += "\n" + _render_reasoning(reasoning)
     if dc_line:
         e += f"\n   - 达成判据：{dc_line}"
     e += (f"\n   - <sub>`{f['rule_id']}` · {f.get('severity','')} · "
