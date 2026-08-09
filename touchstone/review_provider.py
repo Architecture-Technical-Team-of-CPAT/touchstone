@@ -928,19 +928,34 @@ def normalize(items, nmap=None):
         reasoning = it.get("reason") or ""
         if reasoning == direction:
             reasoning = ""            # 说明文字与方向重复时不复读
+        # line_start 缺失时回退 line_end（借鉴 pr-agent 上游 #2510 评审定位精度）：
+        # pr-agent review 类的 key_issues 偶不带 start_line 但带 end_line；此前 line=None
+        # → 渲染 `file:None` + sig 含 `:None` 字面量。line_end 回退让 sig 有真实行号、
+        # 跨轮 reconcile 更稳（行号稳定而非全部塌缩到 :None）。两层兜底：此处取值 +
+        # render._location 渲染侧仍防 `:None`。
+        # 用 `is not None` 而非 `or`：line_start=0 虽罕见（GitHub diff 行号 1-based），
+        # 但 0 是 falsy，`or` 会错误跳过 0 回退到 line_end。与 render._location 的
+        # `is not None` 检查保持一致（两侧同样的 None 判定逻辑）。
+        ls = it.get("line_start")
+        line = ls if ls is not None else it.get("line_end")
         findings.append({
             "rule_id": rid,
             "file": it.get("file"),
-            "line": it.get("line_start"),
+            "line": line,
             "category": cat,
             "severity": nmap.get("default_severity", "warn"),
             "confidence": nmap.get("default_confidence", 0.7),
             "rationale": it.get("summary") or it.get("body"),
             "fix_direction": direction,
             "fix_reasoning": reasoning,
-            # 复核判据（评审意见 1）：给不出确定性判据的模型来源发现，下一轮定向复核该问题。
-            "done_criteria": {"kind": "review",
-                              "spec": {"question": f"「{direction}」是否已按方向解决？"}},
+            # 达成判据（评审意见 1）——诚实降级：model 来源在 normalize 层只有 one_sentence_summary
+            # （=direction），不足以生成设计文档所要求的「一句可回答的具体复核问题」（示例：
+            # 「新增的回滚路径是否覆盖了跨模块调用失败的分支？」）。此前用固定模板
+            # 「{direction}」是否已按方向解决？套 direction 当占位 → 退化为止复读修复方向，
+            # 零新信息。诚实降级：question 留空，渲染层退为「下一轮复检不再命中即销项」
+            # （reconcile 实际机制：sig 不再现即自动销项，本就不靠判据文本）。确定性来源
+            # （contract/probe）仍给真实机器可验判据（recheck rule_id / replay mutant）。
+            "done_criteria": {"kind": "review", "spec": {"question": ""}},
             "suggested_fix": direction,   # 已废弃字段的过渡别名（=方向，不含补丁），供旧消费方
             "agent": "pr-agent:" + it.get("kind", "review"),
         })
