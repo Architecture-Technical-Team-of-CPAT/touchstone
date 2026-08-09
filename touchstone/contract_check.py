@@ -245,6 +245,33 @@ def check_danger_patterns(added, rule_index):
     return out
 
 
+# 本引擎支持的 pr.yaml schema 版本。与 touchstone 软件版本（__version__，SemVer）正交：
+# schema_version 只在 pr.yaml 字段结构/语义 breaking change 时 bump（如改必填字段、改字段
+# 含义），由 schema_version_warning 在运行时核对——未知版本告警但不阻断（向前兼容）。
+SCHEMA_VERSION = "0.1"
+
+
+def schema_version_warning(contract):
+    """pr.yaml 的 schema_version 与引擎支持版本不匹配时的告警串（无问题返回 None）。
+
+    schema_version 标记 pr.yaml 的字段结构版本（非软件版本）。touchstone 软件升 release
+    不改 schema（0.1.0→0.2.2 一直是 0.1）；只有 pr.yaml 字段定义 breaking change 时才 bump。
+    本函数让这个解耦关系在运行时显式：
+      - 缺失 schema_version → 默认按当前 schema 处理（向前兼容，旧 yaml 无此字段）
+      - == SCHEMA_VERSION → 无事
+      - != SCHEMA_VERSION → 告警：可能字段不兼容，提示升级 TOUCHSTONE_ENGINE_REF
+    不进 findings（schema 不匹配不是 author 能修的契约违规，而是 engine/配置版本错配；
+    进 checklist 会污染 author 的销项工作）。调用方（run.py）据此打 stderr 告警。"""
+    sv = (contract or {}).get("schema_version")
+    if sv is None:
+        return None                    # 未声明→默认按当前 schema 处理（向前兼容）
+    if sv != SCHEMA_VERSION:
+        return (f"pr.yaml schema_version={sv!r} 超出本引擎支持的 {SCHEMA_VERSION!r}，"
+                f"字段可能不兼容——升级 TOUCHSTONE_ENGINE_REF 到匹配此 schema 的 touchstone "
+                f"版本，或在 pr.yaml 里改回 schema_version: {SCHEMA_VERSION!r}")
+    return None
+
+
 def check_contract_consistency(diff_text, contract, rule_index):
     """确定性核对契约三项声明（需 manifest）+ 无 manifest 也能跑的纯 diff 事实检查 + SEC-001 密钥扫描
     + DANGER-001 危险代码构造扫描。"""

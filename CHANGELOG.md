@@ -7,6 +7,15 @@
 
 （下个版本的新变更记于此。）
 
+## [0.2.3] — 2026-08-06（配置/版本管理体验：schema_version 告警 + latest 自动跟版）
+
+本版本汇集两项配置与版本管理体验改进，让 pr.yaml 的 `schema_version` 与 touchstone 软件版本的解耦关系在运行时显式，并支持下游零摩擦跟 patch 版本。
+
+### 配置/版本管理体验
+
+- **schema_version 运行时兼容性告警**（#161）：此前 pr.yaml 的 `schema_version` 字段在代码里完全未被读取。现 `contract_check.SCHEMA_VERSION` 常量 + `schema_version_warning()` 在 `run.py` 启动时核对——缺失（旧 yaml 向前兼容）或匹配静默；不匹配 stderr 告警提示升级 `TOUCHSTONE_ENGINE_REF` 或改回已知 schema。不进 findings/checklist（配置错配非 author 能修的契约违规）。`.touchstone/pr.yaml` 模板加字段语义注释。
+- **示例 workflow 支持 `TOUCHSTONE_ENGINE_REF=latest`**（#162）：下游（如 doushuaigong）此前锁具体 tag，每次升级手动改。README 示例改为 env + `gh release view` resolve step——`latest` 自动解析最新 release tag、具体 tag / `main` 原样透传。三选一（`latest` / `v0.2.x` / `main`）行为与适用场景在表格中文档化。配合 schema_version 告警：`latest` 若拉到改了 pr.yaml 字段的 breaking 版本，引擎运行时 stderr 告警兜底。
+
 ## [0.2.2] — 2026-08-06（评审呈现层改进：去冗余 + 定位精度 + 折叠 + 诚实降级）
 
 本版本汇集三项评审呈现层改进，借鉴 pr-agent 上游 #2510 的单条评审写作风格。全部为呈现层变更（无 layer-contract 变更、无 API 破坏），对应 `render._finding_entry` 单条发现的渲染。
