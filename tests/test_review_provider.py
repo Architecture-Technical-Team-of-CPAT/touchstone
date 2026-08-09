@@ -447,7 +447,8 @@ def test_injection_disabled_switch(monkeypatch):
     assert rp._experience_injection('.') == ''
 
 def test_injection_skipped_in_pr_without_trusted_ref(monkeypatch, tmp_path):
-    """PR 事件且未配受信 ref → 即便经验库真实存在也不注入（非空转验证：防投毒 fail-safe）。"""
+    """PR 事件且未配受信 ref → 即便经验库真实存在也不注入（非空转验证：防投毒 fail-safe）。
+    repo_dir 用 tmp_path 隔离：证引擎经验库被闸住（而非"恰巧无 seeds.yaml"）。"""
     import importlib
     from touchstone import learning_loop
     from touchstone import review_provider as rp
@@ -462,9 +463,9 @@ def test_injection_skipped_in_pr_without_trusted_ref(monkeypatch, tmp_path):
         monkeypatch.setenv("TOUCHSTONE_EXPERIENCE_ENABLED", "true")
         monkeypatch.delenv("TOUCHSTONE_EXPERIENCE_REF", raising=False)
         monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
-        assert rp._experience_injection(".") == ""              # PR 无受信 ref：拒注入
+        assert rp._experience_injection(str(tmp_path)) == ""    # PR 无受信 ref：拒注入引擎库
         monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
-        assert "FLAG-T" in rp._experience_injection(".")        # 非 PR：正常注入（证明非空转）
+        assert "FLAG-T" in rp._experience_injection(str(tmp_path))  # 非 PR：正常注入（证明非空转）
     finally:
         monkeypatch.delenv("TOUCHSTONE_STORE_PATH", raising=False)
         importlib.reload(experience_store); importlib.reload(learning_loop)
@@ -508,8 +509,9 @@ def test_experience_injection_passes_include_shadow_when_enabled(monkeypatch, tm
 
 
 def test_shadow_does_not_bypass_experience_ref_gate(monkeypatch, tmp_path):
-    """铁律 5：shadow 开也不绕 EXPERIENCE_REF 防投毒闸——PR 事件 + 无受信 ref → 整体返回 ""
-    （含 shadow candidate，证明 candidate 与 active 同走受信 ref，非空转）。"""
+    """铁律 5：shadow 开也不绕 EXPERIENCE_REF 防投毒闸——PR 事件 + 无受信 ref → 引擎库整段不注入
+    （含 shadow candidate，证明 candidate 与 active 同走受信 ref，非空转）。
+    repo_dir 用 tmp_path 隔离：证引擎库被闸住（而非"恰巧无 seeds.yaml"）。"""
     import importlib
     from touchstone import experience_store, learning_loop
     from touchstone import review_provider as rp
@@ -525,7 +527,7 @@ def test_shadow_does_not_bypass_experience_ref_gate(monkeypatch, tmp_path):
         monkeypatch.setenv("TOUCHSTONE_SHADOW_INJECTION", "1")     # shadow 开
         monkeypatch.delenv("TOUCHSTONE_EXPERIENCE_REF", raising=False)
         monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")    # PR + 无 ref → 必拒
-        assert rp._experience_injection(".") == ""                 # shadow 不绕闸
+        assert rp._experience_injection(str(tmp_path)) == ""       # shadow 不绕闸（引擎库）
     finally:
         for k in ("TOUCHSTONE_STORE_PATH", "TOUCHSTONE_SHADOW_INJECTION"):
             monkeypatch.delenv(k, raising=False)
@@ -560,6 +562,142 @@ def test_shadow_detection_failure_does_not_disable_active_injection(monkeypatch,
         # r2：降级非静默——stderr 打 [warn]（print(stderr) 走 capsys，非 logging）。锁定诊断不被静默移除。
         err = capsys.readouterr().err
         assert "[warn]" in err and "_shadow_injection_enabled" in err and "shadow detection exploded" in err
+    finally:
+        monkeypatch.delenv("TOUCHSTONE_STORE_PATH", raising=False)
+        importlib.reload(experience_store); importlib.reload(learning_loop)
+
+
+# ---------------- seeds.yaml：消费方仓手写规范注入（不走 EXPERIENCE_REF 闸）----------------
+def _write_seeds(repo_dir, body):
+    import os
+    d = os.path.join(repo_dir, ".touchstone")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "seeds.yaml"), "w", encoding="utf-8") as f:
+        f.write(body)
+
+
+def test_seeds_yaml_injected_when_present(monkeypatch, tmp_path):
+    """seeds.yaml 存在 → 团队规范文本进入 extra_instructions（emphasize/suppress 两 kind 都渲染）。"""
+    from touchstone import review_provider as rp
+    _write_seeds(str(tmp_path),
+                 "- finding_type: PRA-ERROR-SWALLOW\n  kind: emphasize\n  text: Flag empty catch.\n"
+                 "- finding_type: PRA-NIT\n  kind: suppress\n  text: Skip fmt nits.\n")
+    monkeypatch.setenv("TOUCHSTONE_EXPERIENCE_ENABLED", "true")
+    monkeypatch.delenv("TOUCHSTONE_EXPERIENCE_REF", raising=False)
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)        # 非 PR：引擎库也允许（此处引擎库空）
+    out = rp._experience_injection(str(tmp_path))
+    assert "Team seed rules" in out
+    assert "PRA-ERROR-SWALLOW" in out and "Flag empty catch" in out
+    assert "PRA-NIT" in out and "Do not raise" in out             # suppress → "Do not raise"
+
+
+def test_seeds_yaml_bypasses_experience_ref_gate(monkeypatch, tmp_path):
+    """核心新能力：PR 事件 + 未配 EXPERIENCE_REF → 引擎经验库被防投毒闸拦（FLAG-E 不出现），
+    但仓内 seeds.yaml（受合并权限保护）仍注入（FLAG-S 出现）——两路来源闸分层。"""
+    import importlib
+    from touchstone import experience_store, learning_loop
+    from touchstone import review_provider as rp
+    store = tmp_path / "exp.json"
+    store.write_text(json.dumps({"experiences": [
+        {"id": "e:::E", "finding_type": "E", "kind": "emphasize",
+         "text": "FLAG-ENGINE", "status": "active", "updated_at": 1},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("TOUCHSTONE_STORE_PATH", str(store))
+    importlib.reload(experience_store); importlib.reload(learning_loop)
+    _write_seeds(str(tmp_path),
+                 "- finding_type: PRA-SEED\n  kind: emphasize\n  text: FLAG-SEED\n")
+    try:
+        monkeypatch.setenv("TOUCHSTONE_EXPERIENCE_ENABLED", "true")
+        monkeypatch.delenv("TOUCHSTONE_EXPERIENCE_REF", raising=False)
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")   # PR + 无 ref
+        out = rp._experience_injection(str(tmp_path))
+        assert "FLAG-SEED" in out                                 # 仓内 seeds.yaml 仍注入
+        assert "FLAG-ENGINE" not in out                           # 跨仓引擎库被防投毒闸拦
+    finally:
+        monkeypatch.delenv("TOUCHSTONE_STORE_PATH", raising=False)
+        importlib.reload(experience_store); importlib.reload(learning_loop)
+
+
+def test_seeds_yaml_respects_master_enabled_switch(monkeypatch, tmp_path):
+    """TOUCHSTONE_EXPERIENCE_ENABLED=false → 两路都关（含 seeds.yaml）：总闸优先于分层闸。"""
+    from touchstone import review_provider as rp
+    _write_seeds(str(tmp_path),
+                 "- finding_type: PRA-SEED\n  kind: emphasize\n  text: FLAG-SEED\n")
+    monkeypatch.setenv("TOUCHSTONE_EXPERIENCE_ENABLED", "false")
+    monkeypatch.delenv("TOUCHSTONE_EXPERIENCE_REF", raising=False)
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    assert rp._experience_injection(str(tmp_path)) == ""          # 总闸关：seeds 也不注入
+
+
+def test_seeds_yaml_merged_with_engine_store(monkeypatch, tmp_path):
+    """两路同时有内容 → 合并输出（引擎库段 + seeds 段都出现），非互斥。"""
+    import importlib
+    from touchstone import experience_store, learning_loop
+    from touchstone import review_provider as rp
+    store = tmp_path / "exp.json"
+    store.write_text(json.dumps({"experiences": [
+        {"id": "e:::E", "finding_type": "E", "kind": "emphasize",
+         "text": "FLAG-ENGINE", "status": "active", "updated_at": 1},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("TOUCHSTONE_STORE_PATH", str(store))
+    importlib.reload(experience_store); importlib.reload(learning_loop)
+    _write_seeds(str(tmp_path),
+                 "- finding_type: PRA-SEED\n  kind: emphasize\n  text: FLAG-SEED\n")
+    try:
+        monkeypatch.setenv("TOUCHSTONE_EXPERIENCE_ENABLED", "true")
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")       # 非 PR：引擎库放行
+        monkeypatch.delenv("TOUCHSTONE_EXPERIENCE_REF", raising=False)
+        out = rp._experience_injection(str(tmp_path))
+        assert "FLAG-ENGINE" in out and "FLAG-SEED" in out        # 两路合并
+    finally:
+        monkeypatch.delenv("TOUCHSTONE_STORE_PATH", raising=False)
+        importlib.reload(experience_store); importlib.reload(learning_loop)
+
+
+def test_seeds_yaml_missing_engine_only(monkeypatch, tmp_path):
+    """无 seeds.yaml → 只引擎库（优雅降级：seed_loader 返 ""，引擎库不受影响）。"""
+    import importlib
+    from touchstone import experience_store, learning_loop
+    from touchstone import review_provider as rp
+    store = tmp_path / "exp.json"
+    store.write_text(json.dumps({"experiences": [
+        {"id": "e:::E", "finding_type": "E", "kind": "emphasize",
+         "text": "FLAG-ENGINE", "status": "active", "updated_at": 1},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("TOUCHSTONE_STORE_PATH", str(store))
+    importlib.reload(experience_store); importlib.reload(learning_loop)
+    try:
+        monkeypatch.setenv("TOUCHSTONE_EXPERIENCE_ENABLED", "true")
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+        monkeypatch.delenv("TOUCHSTONE_EXPERIENCE_REF", raising=False)
+        out = rp._experience_injection(str(tmp_path))             # tmp_path 无 .touchstone/seeds.yaml
+        assert "FLAG-ENGINE" in out
+        assert "Team seed rules" not in out                       # 无 seeds 段
+    finally:
+        monkeypatch.delenv("TOUCHSTONE_STORE_PATH", raising=False)
+        importlib.reload(experience_store); importlib.reload(learning_loop)
+
+
+def test_seeds_yaml_malformed_does_not_break_engine(monkeypatch, tmp_path):
+    """seeds.yaml 解析失败 → seed_loader 优雅降级返 ""；引擎库注入不受影响（故障隔离）。"""
+    import importlib
+    from touchstone import experience_store, learning_loop
+    from touchstone import review_provider as rp
+    store = tmp_path / "exp.json"
+    store.write_text(json.dumps({"experiences": [
+        {"id": "e:::E", "finding_type": "E", "kind": "emphasize",
+         "text": "FLAG-ENGINE", "status": "active", "updated_at": 1},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("TOUCHSTONE_STORE_PATH", str(store))
+    importlib.reload(experience_store); importlib.reload(learning_loop)
+    _write_seeds(str(tmp_path), "not: valid: yaml: [\n")          # 损坏的 yaml
+    try:
+        monkeypatch.setenv("TOUCHSTONE_EXPERIENCE_ENABLED", "true")
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+        monkeypatch.delenv("TOUCHSTONE_EXPERIENCE_REF", raising=False)
+        out = rp._experience_injection(str(tmp_path))
+        assert "FLAG-ENGINE" in out                               # 引擎库照常注入
+        assert "Team seed rules" not in out                       # seeds 降级为空
     finally:
         monkeypatch.delenv("TOUCHSTONE_STORE_PATH", raising=False)
         importlib.reload(experience_store); importlib.reload(learning_loop)

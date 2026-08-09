@@ -65,6 +65,9 @@ jobs:
           TOUCHSTONE_PROTECTED_TYPES: ${{ vars.TOUCHSTONE_PROTECTED_TYPES || '' }}
           TOUCHSTONE_LEARNING_ENABLED: ${{ vars.TOUCHSTONE_LEARNING_ENABLED || 'true' }}
           TOUCHSTONE_GROUND_TRUTH_MIN: ${{ vars.TOUCHSTONE_GROUND_TRUTH_MIN || '10' }}
+          # 真值集回看窗口（默认 code 30；生产扩到 200 覆盖全仓历史——只回看 30 会截断绝大部分
+          # ack done/waived 信号。增量水位 since_pr 已防重复取数，首轮慢后续快）。
+          TOUCHSTONE_GT_WINDOW: ${{ vars.TOUCHSTONE_GT_WINDOW || '200' }}
           # 类型白名单（c1：防 LLM 幻觉 finding_type 污染经验库）。默认关=现状不变：_resolve_taxonomy
           # 读本 env，空/未设 → taxonomy=None → merge_candidates 放行所有类型。开启前须先在
           # TOUCHSTONE_TAXONOMY_TYPES（或 pr-agent.yaml label 集）配齐规范类型——白名单非空时未知类型

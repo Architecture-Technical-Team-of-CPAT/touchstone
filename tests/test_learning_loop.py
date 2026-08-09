@@ -880,6 +880,53 @@ def test_build_ground_truth_waived_does_not_change_adopted_or_ignored(monkeypatc
     assert entry.get("human_waived") == ["PRA-W"]      # 额外标注：PRA-W 是确认豁免
 
 
+# -------- ack done → adopted（放宽 adopted 口径：破"只认 thread resolved"死锁）--------
+# 与 _waived_types 对称：waived+merged→ignored 强信号；done+merged→adopted 强信号。
+# done 是清单 marker 的 status=='done'（机器复检过的 VERIFIED 销项），非 author 说了算。
+
+def test_build_ground_truth_records_ack_done_as_adopted(monkeypatch):
+    """清单 status==done + 人合入 → 进 human_adopted（放宽口径，破 adopted 死锁）。
+    done 经机器复检（sig 不再命中）= VERIFIED，叠加 merge 闸 = 三重背书。"""
+    body = _result_marker([{"rule_id": "PRA-D"}]) + "\n" + _checklist_marker(
+        [{"sig": "PRA-D:src/a.py:10", "status": "done"}])
+    _bg_patch_single_pr(monkeypatch, merged=True, comment_body=body)
+    entry = L.build_ground_truth("o", "r", "tok")[0]
+    assert "PRA-D" in entry["human_adopted"]            # done → adopted
+    assert "PRA-D" not in entry.get("human_ignored", [])  # 进了 adopted 就不在 ignored
+
+
+def test_build_ground_truth_ack_done_requires_merged_gate(monkeypatch):
+    """未合入 → done 不采信（与 waived 对称：done 是 author 申报改了，merge = 人背书改到位）。"""
+    body = _result_marker([{"rule_id": "PRA-D"}]) + "\n" + _checklist_marker(
+        [{"sig": "PRA-D:src/a.py:10", "status": "done"}])
+    _bg_patch_single_pr(monkeypatch, merged=False, comment_body=body)
+    entry = L.build_ground_truth("o", "r", "tok")[0]
+    assert "PRA-D" not in entry.get("human_adopted", [])  # 未合入 → done 不算 adopted
+
+
+def test_build_ground_truth_ack_done_scoped_to_raised_types(monkeypatch):
+    """done 仅限本 PR 真挑过的类型（信任根④：防幻影正例）。"""
+    body = _result_marker([{"rule_id": "PRA-D"}]) + "\n" + _checklist_marker([
+        {"sig": "PRA-D:src/a.py:10", "status": "done"},
+        {"sig": "PRA-OTHER:src/b.py:3", "status": "done"}])
+    _bg_patch_single_pr(monkeypatch, merged=True, comment_body=body)
+    entry = L.build_ground_truth("o", "r", "tok")[0]
+    assert entry["human_adopted"] == ["PRA-D"]           # PRA-OTHER 未挑过 → 不进
+
+
+def test_build_ground_truth_ack_done_independent_from_waived(monkeypatch):
+    """done 与 waived 独立：done→adopted，waived→ignored（同一 PR 上两者可并存）。"""
+    body = (_result_marker([{"rule_id": "PRA-DONE"}, {"rule_id": "PRA-WAIVED"}]) + "\n"
+            + _checklist_marker([
+                {"sig": "PRA-DONE:src/a.py:1", "status": "done"},
+                {"sig": "PRA-WAIVED:src/b.py:2", "status": "waived", "note": "测试夹具"}]))
+    _bg_patch_single_pr(monkeypatch, merged=True, comment_body=body)
+    entry = L.build_ground_truth("o", "r", "tok")[0]
+    assert "PRA-DONE" in entry["human_adopted"]          # done → adopted
+    assert "PRA-WAIVED" in entry["human_ignored"]        # waived → 仍在 ignored（与测试 867 一致）
+    assert entry.get("human_waived") == ["PRA-WAIVED"]   # waived 额外标注
+
+
 # -------- shadow 注入采 A/B with 臂（冷启动破死锁 step2：aggregate_ab 拓宽 with 臂判据）--------
 def test_aggregate_ab_shadow_counts_as_with_arm():
     """shadow_types 让 candidate 进 with 臂（破死锁数据侧）：同类型在 injected_types 或

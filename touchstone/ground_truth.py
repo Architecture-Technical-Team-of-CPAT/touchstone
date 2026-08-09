@@ -203,6 +203,46 @@ def _waived_types(comments, bot_login, touchstone_findings, *, merged):
     return out
 
 
+def _ack_done_types(comments, bot_login, touchstone_findings, *, merged):
+    """从（受信）清单 marker 提取【人合入】的 done 发现类型（adopted 强信号，纯函数）。
+
+    与 _waived_types 对称：waived+merged → ignored 强信号（确认噪声）；
+    done+merged → adopted 强信号（确认采纳——作者改了）。破"只认 GitHub thread resolved"
+    的 adopted 死锁：touchstone 实际工作流用 touchstone-ack（done/waived）而非 thread resolve，
+    只认 thread resolved 致 human_adopted 恒空、graduate 永远不可达。
+
+    done 的强度（三重背书）：
+      ① 清单 marker 的 status=='done' 是 bot 经机器复检（sig 本轮不再命中）后标记的 VERIFIED
+         销项（checklist.VERIFIED={"done"}），非 author 说了算——与 waived（CLAIMED）不同；
+      ② 作者针对该发现改了代码（ack 申报 done）；
+      ③ PR 已合入（merge = 人对"改到位"的隐式背书）。
+
+    信任根（与 _waived_types 完全对齐）：
+      ① 只取 bot 评论里的 touchstone-checklist marker（calibrate._trusted_bodies 过滤），
+         非 bot 发的假清单一律不认；
+      ② done 经 review loop 机器复检（checklist 只对 done 放行收敛，waived/split 不放行）；
+      ③ 仅当 PR 已合入才采信（done 是 author 申报改了，merge = 人背书改到位）；
+      ④ 限定本 PR 真挑过的类型（raised_types）——done 了一个没挑过的类型不产幻影正例。
+    未合入 / 无清单 / 非受信 marker / 无 done 项 → 空集。"""
+    if not merged:
+        return set()
+    from touchstone import checklist as CK
+    from touchstone import calibrate as C
+    cl = CK.parse_latest(C._trusted_bodies(comments, bot_login))
+    raised = {(f.get("rule_id") or f.get("finding_type"))
+              for f in (touchstone_findings or [])}
+    raised = {t for t in raised if t}
+    out = set()
+    for it in (cl or {}).get("items", []):
+        if it.get("status") != "done":
+            continue
+        sig = it.get("sig") or ""
+        rtype = sig.split(":", 1)[0] if ":" in sig else sig    # sig = rule_id:file:line → rule_id
+        if rtype in raised:
+            out.add(rtype)
+    return out
+
+
 def build_ground_truth(owner, repo, token, *, window=GT_WINDOW, bot_login=None,
                        diff_budget=GT_DIFF_BUDGET, since_pr=None):
     """从 GitHub 重建 TF-GRPO 真值集（离线学习的数据入口，需 GITHUB_TOKEN）。
@@ -256,6 +296,21 @@ def build_ground_truth(owner, repo, token, *, window=GT_WINDOW, bot_login=None,
                       file=sys.stderr)
                 fa = []
             resolved_types = {f.get("rule_id") for f in fa if f.get("resolved")}
+            # touchstone-native adopted 强信号：清单 status==done（机器复检过）+ 人合入。
+            # 与 _waived_types 对称（waived+merged→ignored）；放宽 adopted 口径——只认 thread
+            # resolved 致 human_adopted 恒空（touchstone 工作流用 ack 不用 thread resolve），
+            # 加 done 信号破 graduate 死锁（见 _ack_done_types 的三重背书）。
+            # round-2 review：① 显式 `if merged` 守卫（内层函数已早返，call site 显式化更清晰、
+            # 且省掉 unmerged PR 的无谓调用）；② 隔离解析异常（CK.parse_latest / _trusted_bodies
+            # 抛错时不级联跳过整个 PR——降级为空集、按无 done 信号继续，与上方 thread 解析
+            # 失败的 fa=[] 降级同款"per-PR 故障不拖整批"模式）。
+            ack_done_types = set()
+            if merged:
+                try:
+                    ack_done_types = _ack_done_types(comments, bot_login, ts_findings, merged=merged)
+                except Exception as e:
+                    print(f"[learn] PR#{n} ack-done 解析失败（按无 done 信号继续）: {e}", file=sys.stderr)
+            adopted_types = resolved_types | ack_done_types
             # 差距1a：带 file/line 的 resolved 发现（#131 review #2：过滤掉无 line 的——位置级奖励需行号；
             #   无 line 的仅进 resolved_types 做类型匹配，不进 positions，免产 line=null 的废位置）
             resolved_findings = [f for f in fa if f.get("resolved")
@@ -289,7 +344,7 @@ def build_ground_truth(owner, repo, token, *, window=GT_WINDOW, bot_login=None,
             else:
                 signals, weight = None, 1.0
             out.append(make_gt_entry(n, repo, _stack_of(files), pr.get("title", ""),
-                                     diff, ts_findings, resolved_types, human_state,
+                                     diff, ts_findings, adopted_types, human_state,
                                      merged,
                                      injected_types=result.get("injected_types"),
                                      shadow_types=result.get("shadow_types"),

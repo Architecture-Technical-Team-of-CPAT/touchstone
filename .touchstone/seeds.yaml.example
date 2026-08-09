@@ -1,0 +1,40 @@
+# .touchstone/seeds.yaml —— 消费方仓的团队手写规范种子（评审时直接注入、无需 TF-GRPO/学习回路基础设施）。
+#
+# 与引擎经验库（data/experience_store.json，TF-GRPO 学的）互补：
+#   • 引擎经验库：所有消费方共享的通用经验（需 learn.yml + TF-GRPO + graduate 阈值达标）
+#   • 本文件：     该消费方私有的团队规范（直接注入、不走 graduate、无需任何基础设施）
+#
+# 激活方式：把本文件改名为 seeds.yaml（或新建 .touchstone/seeds.yaml），确保
+#   TOUCHSTONE_EXPERIENCE_ENABLED 未显式置 false（默认 true）。
+#   不需要 learn.yml、不需要经验库、不需要 TF-GRPO、不需要旗舰模型端点。
+#
+# 安全模型：本文件是仓内配置（与 pr-agent.yaml/standards.yaml 同级），受 PR 合并权限保护——
+#   "篡改本文件"= 提交一个改 seeds.yaml 的 PR，已由 code review + 合并权限覆盖。
+#   因此【不走】TOUCHSTONE_EXPERIENCE_REF 防投毒闸（那个闸只针对跨仓引擎经验库）。
+#
+#   threat-model 诚实标注：评审时本文件从 PR 工作树读，其 text 字段会进 PR-Agent 提示词。
+#   这与 pr-agent.yaml/standards.yaml/best_practices.md 同款（都是 PR-head 配置影响评审提示词），
+#   非 seeds.yaml 独有向量。EXPERIENCE_REF 是【额外】防线——专给跨仓、机器学习产出、非逐行
+#   人审的引擎经验库加的（更高价值投毒目标）。seeds.yaml 的 text 走长度封顶（限注入面）+
+#   评审输出 advisory-only（无合入权）+ code review 三层缓解。若你的仓对 prompt 注入零容忍，
+#   请评估是否在受限评审（仅成员 PR）下启用。
+#
+# 格式：YAML 列表，每项一条规范。字段：
+#   finding_type: 规范类型标识（与评审发现的 rule_id/finding_type 对齐，如 PRA-ERROR-SWALLOW）
+#   kind:         emphasize（多盯紧这类问题）/ suppress（少挑/不挑这类问题）
+#   text:         给 PR-Agent 的英文指令（评审提示词是英文环境）；一句讲清"要/不要什么"
+#   stack:        可选，技术栈过滤（python/go/rust/...）；留空或不写 = 对所有栈生效
+#
+# 示例（删掉或改成你们团队的规范）：
+- finding_type: PRA-ERROR-SWALLOW
+  kind: emphasize
+  stack: python
+  text: Flag bare `except:` and empty catch blocks; they swallow errors silently and hide bugs.
+
+- finding_type: PRA-SECRET-IN-LOG
+  kind: emphasize
+  text: Watch for secrets/tokens/keys logged or embedded in error messages; require redaction.
+
+- finding_type: PRA-NIT
+  kind: suppress
+  text: Don't raise formatting nits (trailing whitespace, quote style); the linter/formatter handles them.

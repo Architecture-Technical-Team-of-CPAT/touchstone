@@ -7,6 +7,18 @@
 
 （下个版本的新变更记于此。）
 
+## [0.2.5] — 2026-08-06（adopted 信号放宽 + 消费方团队规范种子）
+
+本版本汇集两项学习回路与评审注入的改进：放宽 adopted 信号采集口径以破 graduate 死锁；新增消费方仓的团队手写规范种子机制。
+
+### adopted 信号放宽（破 graduate 死锁）
+
+- **ack `done` + merged → human_adopted**（#165）：此前 `build_ground_truth` 只认 thread-resolved 发现为 `human_adopted`——touchstone 工作流用 ```touchstone-ack``` 不用 thread resolve，致 29 条真值里 `human_adopted` 恒空、graduate 阈值（20+20 臂）数学上不可达。现新增 `_ack_done_types`（与 `_waived_types` 对称）：清单 marker `status=="done"`（机器复检过 sig 消失）+ 人合入 → 计为 adopted 强信号。配套 `GT_WINDOW` 默认 30→200 覆盖全仓历史。`if merged` 守卫 + try/except 隔离解析异常（per-PR 故障不拖整批）。
+
+### 消费方团队规范种子（`.touchstone/seeds.yaml`）
+
+- **无需学习回路基础设施的团队规范注入**（#166）：任何消费方仓可在 `.touchstone/seeds.yaml`（样例见 `seeds.yaml.example`）写团队手写规范，评审时**直接注入** PR-Agent 提示词——无需 learn.yml、无需经验库、无需 TF-GRPO、无需旗舰模型。与引擎经验库（TF-GRPO 学的、跨仓共享）分层共存：引擎库走 `TOUCHSTONE_EXPERIENCE_REF` 防投毒闸；seeds.yaml 是仓内配置（与 pr-agent.yaml 同级、受合并权限保护）不走该闸；两路同受 `TOUCHSTONE_EXPERIENCE_ENABLED` 总闸。`emphasize`（多盯紧）/ `suppress`（少挑）两 kind，可选 `stack` 技术栈过滤。防御纵深：text 500 字 + finding_type 80 字封顶、非 str stack fail-open + [warn]、repo_dir isdir 校验、解析失败优雅降级。诚实标注威胁模型（与 pr-agent.yaml 同款 PR-head 配置向量）与栈过滤 gap（主评审路径不持有栈上下文）。
+
 ## [0.2.3] — 2026-08-06（配置/版本管理体验：schema_version 告警 + latest 自动跟版）
 
 本版本汇集两项配置与版本管理体验改进，让 pr.yaml 的 `schema_version` 与 touchstone 软件版本的解耦关系在运行时显式，并支持下游零摩擦跟 patch 版本。

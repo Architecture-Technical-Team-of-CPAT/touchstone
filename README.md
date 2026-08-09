@@ -88,6 +88,7 @@ python -m touchstone.run --repo owner/name --pr 314 --post
 | `pr-agent.yaml` | PR-Agent 原始输出 → 内部 `Finding` 的归一映射 |
 | `best_practices.md` | 主观规则库,作为喂 PR-Agent 评审侧的 prompt 素材 |
 | `acceptance.yaml.example` | 人核准验收规格样例(verify 用,可选) |
+| `seeds.yaml.example` | 团队手写规范种子样例(评审直接注入,无需学习回路基础设施,可选) |
 
 ## GitHub 集成
 
@@ -281,6 +282,7 @@ pr-agent **取 PR** 用 workflow 自带的 `GITHUB_TOKEN`——**无需额外配
 - **autonomy(自治)**:默认关,需要足够的校准数据证明某变更类"放行靠谱"后才逐步开放。
 - **学习回路 / TF-GRPO**:两档都已实现、离线可跑——计数式蒸馏,以及核心的 **TF-GRPO**(策略冻结 + 组内语义优势把经验蒸馏成注入提示词的 token prior,取自 arXiv 2510.08191,机制见 `docs/learning-loop-design.html` 第 3 节)。TF-GRPO 经注入的 `llm` 调用旗舰模型,离线用假 llm 覆盖测试;生产需配置一个参数固定的旗舰模型端点(`LLM_BASE_URL`/`LLM_API_KEY`/`TOUCHSTONE_FLAGSHIP_MODEL`)与一份历史 PR 真值集。出于稳健,新经验先 shadow A/B 达标才注入、且只影响建议不碰合入。因为经验是人能读写的自然语言,**人能直接读写它学到的东西**:手写种子(`seed_experience`)、审校候选、立红线(受保护类型永不 suppress、`locked` 经验不被回路改写/退役)、调奖励权重——见 `docs/learning-loop-design.html` 第 6 节。蒸馏器**可插拔**:`register_distiller` 注册自有实现、env `TOUCHSTONE_DISTILLER` 按名切换,`_distill_via_llm` 的 rollout/score/distill 三步也可单独注入——整体或局部换成你们自己的实现都行。
 - 还有一些预留的可替换实现(比如内网 embedding、不同语言的测试 runner),默认都不启用,确认依赖就绪后再接入。
+- **消费方团队规范(`.touchstone/seeds.yaml`)**:不想跑学习回路、也不想等 graduate 达标的消费方,可在自己仓库放一份 `.touchstone/seeds.yaml`(样例见 `seeds.yaml.example`)——手写的团队规范在评审时**直接注入** PR-Agent 提示词,无需 learn.yml、无需经验库、无需旗舰模型。它与引擎经验库分层共存:引擎库(跨仓共享、TF-GRPO 学的)走 `TOUCHSTONE_EXPERIENCE_REF` 防投毒闸;`seeds.yaml`(仓内配置、受合并权限保护)不走该闸。两路都受 `TOUCHSTONE_EXPERIENCE_ENABLED` 总闸控制。
 
 ## 设计文档
 

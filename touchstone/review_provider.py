@@ -26,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 
+from touchstone import seed_loader   # 模块级导入（round-2 review）：seed_loader 轻量（仅 os/sys/yaml）、
+                                     # 无循环引用风险——import 失败在启动期暴露而非藏在评审路径里。
 # ---- PR-Agent label → 本系统 category 的默认映射（可被 .touchstone/pr-agent.yaml 覆盖）----
 # PR-Agent improve 工具的 label 取值见其 $PRCodeSuggestions schema。
 _DEFAULT_NMAP = {
@@ -467,44 +469,80 @@ def _provider_mode(pr_ctx):
 
 
 def _experience_injection(repo_dir):
-    """学习回路的 active 经验 → PR-Agent extra_instructions（只读、可空、失败即空）。
-    符合"评审路径只读经验库"的边界；经验只调建议、不进闸。
-    TOUCHSTONE_EXPERIENCE_ENABLED=false 时整体关闭注入（默认开）。"""
+    """两条来源 → PR-Agent extra_instructions（只读、可空、失败即空）。
+
+    路 1 引擎经验库（data/experience_store.json，TF-GRPO 学的）：跨仓共享、走
+        EXPERIENCE_REF 防投毒闸（PR 事件下未配受信 ref → 跳过；否则会被本 PR 篡改
+        的工作树投毒）。
+    路 2 消费方 seeds.yaml（repo_dir/.touchstone/seeds.yaml，团队手写规范）：仓内
+        配置、受合并权限保护（与 pr-agent.yaml 同级），【不走】EXPERIENCE_REF 闸——
+        防 PR 篡改工作树投毒只对跨仓引擎经验库成立，仓内配置的"投毒"即提交一个改
+        seeds.yaml 的 PR，已由 code review + 合并权限覆盖。
+
+    TOUCHSTONE_EXPERIENCE_ENABLED=false 时两路整体关闭（默认开）。经验/种子只调
+    建议、不进闸（符合"评审路径只读"的边界）。
+
+    已知 gap（诚实标注）：本函数不持有当前 PR 的技术栈上下文，故 seeds.yaml 的 stack
+    字段在主评审路径不生效（带栈的种子也注入）。多数团队规范通用（不标 stack），不受影响。"""
     if os.environ.get("TOUCHSTONE_EXPERIENCE_ENABLED", "true").lower() not in ("1", "true", "yes", "on"):
         return ""
-    # 纵深防御：PR 事件下未配受信 ref（TOUCHSTONE_EXPERIENCE_REF）则跳过注入——
-    # 否则经验库会从可被本 PR 篡改的工作树读（投毒/提示注入）。工作流已配 ref 时无影响。
-    if (os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
-            and not os.environ.get("TOUCHSTONE_EXPERIENCE_REF")):
-        import sys as _sys
-        print("[warn] PR 评审未配置 TOUCHSTONE_EXPERIENCE_REF → 跳过经验注入（防经验库投毒）",
-              file=_sys.stderr)
-        return ""
-    try:
-        from touchstone import learning_loop
-        # include_shadow 透传：env TOUCHSTONE_SHADOW_INJECTION 开时，active 段后追加 shadow candidate
-        # 段（advisory only、文本标灰）。shadow 与 active 读同一 store、同一 EXPERIENCE_REF 防投毒闸——
-        # 上方 L473-480 未配受信 ref 即整体返回 ""（含 shadow），candidate 也走受信 ref（铁律 5）。
-        # 时序耦合：须与 orchestrator marker 归因（step3）读同一开关，否则 marker 说"注入了 shadow X"
-        # 但此处未渲染 → with 臂归因失真；两处 env 默认关 = 字节级等价现状。
-        # _shadow_injection_enabled() 独立求值 + 安全降级（pr-agent #118 r1）：它抛异常时降级 False
-        # （只禁 shadow 段），不级联进外层 except 禁用整个经验注入含 active（与 step3 :504 同类隔离）。
+
+    parts = []
+
+    # 路 1：引擎经验库（跨仓共享）—— PR 事件下须配受信 ref 防 PR 篡改工作树投毒
+    # include_shadow 透传：env TOUCHSTONE_SHADOW_INJECTION 开时，active 段后追加 shadow candidate
+    # 段（advisory only、文本标灰）。shadow 与 active 读同一 store、同一 EXPERIENCE_REF 防投毒闸——
+    # 未配受信 ref 即跳过整段引擎库（含 shadow）。时序耦合：须与 orchestrator marker 归因（step3）
+    # 读同一开关，否则 marker 说"注入了 shadow X"但此处未渲染 → with 臂归因失真；两处 env 默认关。
+    # _shadow_injection_enabled() 独立求值 + 安全降级（pr-agent #118 r1）：它抛异常时降级 False
+    # （只禁 shadow 段），不级联进外层 except 禁用整个经验注入含 active（与 step3 :504 同类隔离）。
+    engine_ref_ok = not (os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
+                         and not os.environ.get("TOUCHSTONE_EXPERIENCE_REF"))
+    if engine_ref_ok:
         try:
-            include_shadow = learning_loop._shadow_injection_enabled()
+            from touchstone import learning_loop
+            try:
+                include_shadow = learning_loop._shadow_injection_enabled()
+            except Exception as _e:
+                # 诊断不静默（pr-agent #118 r2）：shadow 开关求值出错时仍降级 False（active 不受影响），
+                # 但打 stderr 告警——运维能看到 shadow 段被关的原因（CLAUDE.md §3 诚实标 gap、不掩盖问题；
+                # 与下方 EXPERIENCE_REF 跳过注入告警同款 [warn] print 模式）。
+                import sys as _sys
+                print(f"[warn] _shadow_injection_enabled() 求值失败 → 降级 include_shadow=False"
+                      f"（shadow 段关闭、active 注入不受影响）：{_e}", file=_sys.stderr)
+                include_shadow = False
+            engine_text = learning_loop.render_injection(
+                learning_loop.load_store(),
+                include_shadow=include_shadow,
+            ) or ""
+            if engine_text:
+                parts.append(engine_text)
         except Exception as _e:
-            # 诊断不静默（pr-agent #118 r2）：shadow 开关求值出错时仍降级 False（active 不受影响），
-            # 但打 stderr 告警——运维能看到 shadow 段被关的原因（CLAUDE.md §3 诚实标 gap、不掩盖问题；
-            # 与上方 L477-479 跳过注入告警同款 [warn] print 模式）。
+            # 不静默（round-1 review + 静默纪律闸）：引擎库注入异常时降级为空（不影响 seeds 段），
+            # 但打 [warn] 让运维可见——load_store/render_injection 真挂时不会"无声丢一段"。
             import sys as _sys
-            print(f"[warn] _shadow_injection_enabled() 求值失败 → 降级 include_shadow=False"
-                  f"（shadow 段关闭、active 注入不受影响）：{_e}", file=_sys.stderr)
-            include_shadow = False
-        return learning_loop.render_injection(
-            learning_loop.load_store(),
-            include_shadow=include_shadow,
-        ) or ""
-    except Exception:
-        return ""
+            print(f"[warn] 引擎经验库注入异常 → 降级为空（seeds 段不受影响）：{_e}", file=_sys.stderr)
+    else:
+        # 引擎库跳过——告警主旨是"引擎经验库被防投毒闸拦"（reviewer 可据因配 EXPERIENCE_REF）。
+        # seeds.yaml（仓内配置）仍走自己的路；用"如有"标注、不假定其存在（round-4 review：避免
+        # 无 seeds.yaml 的仓被误以为"丢了注入"）。
+        print("[warn] PR 评审未配置 TOUCHSTONE_EXPERIENCE_REF → 跳过引擎经验库注入（防投毒）。"
+              "如本仓有 .touchstone/seeds.yaml，其团队规范仍注入（仓内配置不走该闸）。", file=sys.stderr)
+
+    # 路 2：消费方 seeds.yaml（仓内配置）—— 受合并权限保护、不走 EXPERIENCE_REF 闸
+    try:
+        seed_text = seed_loader.load_seed_injection(repo_dir)
+        if seed_text:
+            parts.append(seed_text)
+    except Exception as _e:
+        # 不静默（round-1 review + 静默纪律闸）：seed_loader 内部已优雅降级返 ""，走到这里说明是
+        # 非预期缺陷（如 TypeError）；降级为空不阻塞评审，但打 [warn] + traceback 暴露真实缺陷
+        # （round-4 review：仅异常字符串难定位，补 traceback 便于生产诊断）。
+        import traceback as _tb
+        print(f"[warn] seeds.yaml 注入异常 → 降级为空（引擎库段不受影响）：{_e}\n{_tb.format_exc()}",
+              file=sys.stderr)
+
+    return "\n\n".join(p for p in parts if p)
 
 
 # ---- fan-out：improve / review 两个子进程并行 --------------------------------
