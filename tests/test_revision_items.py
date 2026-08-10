@@ -171,13 +171,95 @@ def test_long_reasoning_collapsed_into_details():
 
     author 一眼扫清单只看标题+方向；需要依据细节时再点开。pr-agent 上游 #2510 同样把
     Issue description / Issue Context 放 <details> 折叠，默认只露标题 + 一句后果。"""
-    from touchstone.render import _finding_entry
+    from touchstone.render import _finding_entry, _TEASER_MAX
     long = "x" * 250
     f = _rf("PRA-X", reasoning=long)
     entry = _finding_entry(1, f)
     assert "<details>" in entry and "</details>" in entry
-    assert f"依据（{len(long)} 字，点击展开）" in entry   # summary 露字数
-    assert long in entry                                  # 全文在 details body 内
+    assert f"依据（{len(long)} 字）" in entry             # summary 露字数
+    assert long[:_TEASER_MAX] in entry                     # summary 露前 60 字（关键信息预览）
+    assert long in entry                                   # 全文在 details body 内（API 取全文不变）
+
+
+def test_details_summary_shows_first_sentence_teaser():
+    """<details> summary 露首句/前若干字（关键信息预览），author 不展开也能判读依据要点。
+
+    用户 #168 续——「计划把关键信息的 summary 展示出来，其他通过点击详情按钮来展开」：
+    summary 从无信息标签「依据（N 字）」升级为首句预览（核心论断）。两条硬约束：
+    (a) 不能动态获取——summary 与 body 均静态嵌入 markdown，点击展开无网络请求；
+    (b) 不能影响 API 取全量 review 意见——body 完整保留 reasoning 全文（API 取评论原文即得全文）。"""
+    from touchstone.render import _render_reasoning, _TEASER_MAX
+    first_sentence = "版本号从 0.2.3 跳到 0.2.5，跳过了 0.2.4，需确认 CHANGELOG。"
+    long = first_sentence + "后续展开论证" * 40            # > 200 字符阈值 + 首句 < max_len
+    out = _render_reasoning(long)
+    # summary 在首句处截断，露出核心论断（不展开也可见）
+    assert "版本号从 0.2.3 跳到 0.2.5" in out
+    assert "…" in out                                       # 截断标记（首句后还有内容）
+    # body 完整保留全文（约束 b：API 取全文不变）
+    assert long in out
+    # 首句长度 < max_len → teaser 取整句（不被硬截断到 max_len）
+    assert first_sentence in out
+
+
+def test_details_summary_truncates_runon_sentence_to_max_len():
+    """首句超长（无句末标点）→ teaser 硬截断到 _TEASER_MAX 字，加 …。"""
+    from touchstone.render import _render_reasoning, _reasoning_teaser, _TEASER_MAX
+    runon = "a" * 250                                       # 无句末标点
+    teaser = _reasoning_teaser(runon)
+    assert teaser.endswith("…")
+    assert len(teaser) == _TEASER_MAX + 1                   # 60 字 + …
+    out = _render_reasoning(runon)
+    assert runon in out                                     # body 全文
+
+
+def test_teaser_strict_max_len_when_first_sentence_exceeds():
+    """首句末标点恰在 max_len 之外 → 硬截断到 max_len（不留余量），加 …。
+
+    回归 #168 round-2「strict max length」：此前 max_len+5 余量会让首句 teaser 长达
+    max_len+6，与 _TEASER_MAX 语义不符、与 run-on 分支（max_len+1）不一致。"""
+    from touchstone.render import _reasoning_teaser, _TEASER_MAX
+    # 首句 = (max_len+10) 个 a + 句号；句末在 max_len+11 处（> max_len）→ 走硬截断分支
+    first_sentence = "a" * (_TEASER_MAX + 10) + "。"
+    long = first_sentence + "后续展开论证" * 100
+    teaser = _reasoning_teaser(long)
+    assert teaser == "a" * _TEASER_MAX + "…"                # 硬截断到 max_len + …
+    assert len(teaser) == _TEASER_MAX + 1                   # 严格 ≤ max_len + 1
+
+
+def test_details_body_flattens_internal_blank_lines():
+    """reasoning 自带空行（多段依据 / 含 \\n\\n 的代码片段）不破 <details> HTML block。
+
+    回归 #168 round-2 PRA-POSSIBLE_ISSUE：body 原样嵌 {reasoning} 时其内部空行同样会
+    截断 type-6 HTML block（与 summary/body 间空行同因）。折叠 body 空白（\\s+→空格）
+    成单行——内容一字不丢，仅丢多段排版；marker 存 reasoning 原文，API 取全文不受影响。"""
+    from touchstone.render import _render_reasoning
+    long = ("第一段依据，说明问题。" + "详情" * 100 + "\n\n" +   # 段间空行
+            "第二段依据，补充论证。" + "更多" * 100)
+    out = _render_reasoning(long)
+    assert "<details>" in out and "</details>" in out
+    blk = out[out.index("<details>"):out.index("</details>") + len("</details>")]
+    assert "\n\n" not in blk                          # 折叠后 body 无空行（HTML block 完整）
+    # 内容不丢（两段都在 body 内）
+    assert "第一段依据" in out and "第二段依据" in out
+
+
+def test_details_block_has_no_blank_lines_inside():
+    """回归 #167 review：<details> 是 CommonMark type-6 HTML block，遇空行即终止。
+    若 </summary> 与 body、body 与 </details> 之间有空行，<details> 在首个空行处被截断成
+    孤立开标签——body 变成列表项里的松散段落（始终可见、不在折叠区）、</details> 变孤立闭
+    标签，表现即「点击展开」无反应（展开后空、正文跑到外面）。整段 <details>...</details>
+    须留在同一 HTML block 内（无空行）才是完整可折叠元素。"""
+    from touchstone.render import _render_reasoning
+    long = "依据正文内容。" * 30          # > 200 字符阈值，触发折叠分支
+    out = _render_reasoning(long)
+    assert "<details>" in out and "</details>" in out
+    # 取 <details> 到 </details> 的片段，断言其内无空行（无连续两个 \n）
+    details_block = out[out.index("<details>"):out.index("</details>") + len("</details>")]
+    assert "\n\n" not in details_block, (
+        "<details> 块内含空行 → HTML block 在首个空行处截断，折叠失效（#167 回归）")
+
+
+
 
 
 def test_reasoning_equal_to_rationale_not_rendered():
