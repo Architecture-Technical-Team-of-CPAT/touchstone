@@ -1,0 +1,116 @@
+# gitleaks 配置 —— 密钥/敏感信息扫描（确定性门禁 SEC-001 的高召回补位）
+# 文档：https://github.com/gitleaks/gitleaks#configuration
+#
+# 设计分工（见 touchstone/contract_check.py:152-156 的 SEC-001 冻结声明）：
+#   - SEC-001 内置：高精度特征串（AKIA/ghp_/sk-/PEM 等），离线兜底、永不放行。
+#   - gitleaks（本配置）：熵分析 + 值 allowlist（占位符/私网段）+ IP/密码自定义规则。
+#     零路径排除——不按目录跳文件（防 test/vendor 成蓄意藏匿通道，详见末尾全局 allowlist 注释）。
+#   - 用户名：不扫（结构上不可确定性检出、误报率极高——"admin"/"root" 在合法代码里高频出现）。
+
+title = "touchstone gitleaks 配置"
+
+[extend]
+useDefault = true       # 继承 gitleaks 内置规则（AWS/GitHub/OpenAI/PEM/JWT/Stripe/Slack/Google…）
+
+# ============================================================================
+# 自定义规则（默认启用：公网 IP + 通用密码）
+# ============================================================================
+
+# ---- 公网 IP 地址（内网拓扑/服务地址泄露）--------------------------------------
+[[rules]]
+id = "hardcoded-public-ip"
+description = "硬编码公网 IP 地址（疑似内网/服务地址泄露）"
+# 上下文限定：IP 须出现在 host/ip/addr/server/connect 等键名近邻——降误报：
+# 裸版本号、注释/docstring 里的示例 IP、无关数字串不命中。
+# 边界对称（评审 round-1 修复）：
+#   - 前导 `(?:^|[^a-zA-Z])`：显式覆盖大小写（不靠 (?i) 隐式展开字符类，防误读），
+#     `_`/`.`/空格 均算前导边界，覆盖 DB_HOST / server_ip 等 snake_case 复合名。
+#   - 尾部 `(?:[^a-zA-Z0-9.\n]|$)`：不用 `\b`（`\b` 在 digit→`_` 不触发，会漏 `1.2.3.4_backup`）；
+#     显式排除字母/数字/点/换行——防 `1.2.3.456`（数字续）与 `1.2.3.4.5`（点续）假匹配。
+# `(?im)`：i=大小写无关匹配关键词；m=`^`/`$` 按行匹配（gitleaks 整文件喂入时也正确）。
+regex = '''(?im)(?:^|[^a-zA-Z])(?:host|ip|addr|server|endpoint|peer|node|connect|broker|upstream|gateway|remote|proxy)\w*\s*[:=,(]\s*['"]?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?:[^a-zA-Z0-9.\n]|$)'''
+secretGroup = 1
+keywords = ["host", "ip", "addr", "server", "endpoint", "connect", "broker", "upstream"]
+
+# 规则级 allowlist（仅对本规则生效——评审 round-1 修复：原全局 allowlist 会误压
+# 含 "10.0.0.5" 子串的真实凭据。收窄到规则级后，IP 段 allowlist 只影响 IP 规则，
+# 不干扰 useDefault 的云凭据规则）。
+[[rules.allowlists]]
+description = "私网/loopback/link-local/CGN/multicast/掩码/文档段/常见公网 DNS 不拦"
+regexes = [
+  # RFC 1918 私网三段
+  '''^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$''',
+  '''^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$''',
+  '''^192\.168\.\d{1,3}\.\d{1,3}$''',
+  # loopback 127.0.0.0/8
+  '''^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$''',
+  # link-local 169.254.0.0/16
+  '''^169\.254\.\d{1,3}\.\d{1,3}$''',
+  # CGN（运营商级 NAT）100.64.0.0/10
+  '''^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$''',
+  # multicast 224.0.0.0/4（224-239）
+  '''^2[2-3]\d\.\d{1,3}\.\d{1,3}\.\d{1,3}$''',
+  # unspecified / broadcast
+  '''^0\.0\.0\.0$''',
+  '''^255\.255\.255\.255$''',
+  # 常见 contiguous 子网掩码（/8~/31）
+  '''^255\.255\.255\.(0|128|192|224|240|248|252|254)$''',
+  '''^255\.255\.(254|252|248|240|224|192|128|0)\.0$''',
+  '''^255\.(254|252|248|240|224|192|128|0)\.0\.0$''',
+  '''^255\.0\.0\.0$''',
+  # RFC 5737 文档示例段（TEST-NET-1/2/3，文档/教学代码里安全出现）
+  '''^192\.0\.2\.\d{1,3}$''',
+  '''^198\.51\.100\.\d{1,3}$''',
+  '''^203\.0\.113\.\d{1,3}$''',
+  # 常见公网 DNS（非敏感、代码高频出现）
+  '''^8\.8\.(8\.8|4\.4)$''',                 # Google Public DNS
+  '''^1\.1\.1\.1$''',                        # Cloudflare primary
+  '''^1\.0\.0\.1$''',                        # Cloudflare secondary
+  '''^208\.67\.222\.222$''',                 # OpenDNS primary
+  '''^208\.67\.220\.220$''',                 # OpenDNS secondary
+  '''^9\.9\.9\.9$''',                        # Quad9
+]
+
+# ---- 通用硬编码密码（赋值形态 + 熵阈值）---------------------------------------
+[[rules]]
+id = "generic-hardcoded-password"
+description = "硬编码密码（赋值形态 + 熵阈值）"
+# 首字符排除 `$`（防 $DB_PASSWORD / ${ENV} 变量引用被当硬编码值），中段允许 `$`/`#`（真密码常含特殊字符）。
+# entropy=3.0：过滤低熵默认值（password/123456/admin 等——这些是弱口令但也是常见测试夹具，
+# 降熵阈值若想连弱口令一起拦可调到 2.0）。
+regex = '''(?i)(?:password|passwd|pwd|passphrase|secret)\b\s*[:=]\s*['"]([^'"\s$][^'"\s]{7,})['"]'''
+secretGroup = 1
+entropy = 3.0
+keywords = ["password", "passwd", "pwd", "passphrase", "secret"]
+
+# 规则级 allowlist（仅对密码规则生效——评审 round-1 修复：原全局 allowlist 会误压
+# 含 "example" 子串的真实云凭据。收窄后，占位符匹配只影响密码规则）。
+# 注：无 `(^|_|x)` 前缀（评审指出 `x` 前缀过宽，会放行 `xexample` 类值）——
+# 与 SEC-001 _PLACEHOLDER 同构，直接子串匹配（example/sample 等词本身够辨识）。
+[[rules.allowlists]]
+description = "密码占位符/示例值不拦"
+regexes = [
+  '''(?i)(example|sample|placeholder|changeme|changed?|xxxx|<[^>]+>|your[_-]?\w+|_here|redacted|dummy|fake|replace[_-]?me|todo|none|null|bar|baz|foo)''',
+]
+
+# ============================================================================
+# 全局 allowlist —— 刻意留空（零路径排除，安全优先）
+# ============================================================================
+# 设计决策：不按路径排除任何文件/目录。早期版本排除过 tests/mocks/fixtures/
+# vendor/*.md/*.lock 等——但 gitleaks 的 paths 是【无条件跳文件】(不扫内容)，
+# 员工把真凭据塞进 test 目录即可绕过扫描(蓄意藏匿通道)。对安全敏感仓这是
+# 不可接受的安全缺口。
+#
+# 现改为：全部文件都扫，靠【值过滤】治假阳性——
+#   - 占位符/示例值正则 (见各 [[rules.allowlists]] 的 regexes)
+#   - 熵阈值 (密码规则 entropy=3.0，过滤 test123/admin 等低熵夹具)
+# test 夹具里熵够高、"像真的"假密码仍会命中——由开发者复核后 waive；
+# 这个"人看一眼"正是安全想要的控制点(宁可多看一眼，不可漏一个)。
+#
+# 副产品：本配置文件 .gitleaks.toml 自身也被扫——已验证零自命中：
+#   - IP 规则文本里是 `\d{1,3}` 字面量(非真数字)，且无 host= 等键值上下文；
+#   - 密码规则文本里 `password|passwd` 后跟管道/引号(非 [:=])，不匹配；
+#   - useDefault 云凭据规则：注释里的 AKIA/ghp_/sk- 均非完整格式(位数不足)，不命中。
+#
+# 若将来某文件确属【结构性强噪声】(如生成的 lock 文件、第三方 lockfile)，请在该
+# 文件级用 .gitattributes/git-lfs 处理，或单独评估——而非在此开全局路径口子。

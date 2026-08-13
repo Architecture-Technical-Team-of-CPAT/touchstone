@@ -15,6 +15,7 @@ import re
 import sys
 
 from touchstone.llm_budget import MAX_FINDINGS_IN_SUMMARY
+from touchstone.checklist import sig_of          # 清单签名构造（finding → sig，做 findings↔清单项 join）
 
 _TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "templates", "review_report.md")
@@ -28,7 +29,7 @@ def _load_template():
             return f.read()
     except OSError as e:
         print(f"[warn] 版面模板读取失败（{e}），使用内置极简版面", file=sys.stderr)
-        return "{{banner}}\n\n{{summary_line}}\n\n{{facts}}\n\n{{findings}}\n\n{{checklist}}\n\n{{verification}}\n\n{{markers}}"
+        return "{{status}}\n\n{{alerts}}\n\n{{facts}}\n\n{{findings}}\n\n{{reference}}\n\n{{markers}}"
 
 
 _TEMPLATE_SLOT_RE = re.compile(r"\{\{(\w+)\}\}")
@@ -66,18 +67,8 @@ def render_unreliable_callout(engine_status, ai_raw_count=0, added_lines=0, engi
     ])
 
 
-def _location(f):
-    """渲染位置串——行号缺失时不显示 `:None`（借鉴 pr-agent 上游 #2510 评审的定位精度）。
-
-    pr-agent 偶不返回 relevant_lines_start（review 类 key_issues 的 start_line 缺失），
-    此前 f.get('line','?') 对 line=None 返回 None（键在但值为 None），渲染为 `file:None`——
-    既丑又让 author 误以为「行号是字面量 None」。行号缺失时只显示文件名，干净且不误导。
-
-    review_provider.normalize 已做 line_start→line_end 回退（本 PR 配套），此处是渲染侧的
-    最终兜底：两层联合保证 `:None` 永不出现在评审报告里。"""
-    file_ = f.get("file") or "?"
-    line_ = f.get("line")
-    return f"{file_}:{line_}" if line_ is not None else file_
+# v2：_location（v1 位置串渲染）已移除——sig 兼作位置显示（checklist.sig_of 在构造时
+# 防 `file:None`），不再单列位置行。位置精度兜底移至 sig_of 构造源（一处修两处一致）。
 
 
 _REASONING_COLLAPSE_THRESHOLD = 200
@@ -113,13 +104,17 @@ def _reasoning_teaser(reasoning, max_len=_TEASER_MAX):
     return first
 
 
-def _render_reasoning(reasoning):
+def _render_reasoning(reasoning, indent="   "):
     """渲染依据字段——长文折叠进 <details>（借鉴 pr-agent 上游 #2510 的 Agent Prompt 折叠）。
 
     pr-agent #2510 评审把详细 Issue description / Issue Context 放 <details> 折叠，默认只露
     标题 + 一句后果，降低视觉噪声。本系统同理：依据 ≤200 字符平铺（短依据是快速判读信号），
     超阈值折叠——summary 露首句/前若干字（关键信息预览，author 不展开也能判读），body 完整
     保留（author 需要细节时展开）。
+
+    indent 参数：子列表项缩进空格数。编号列表（`1. `）用默认 3 空格；task list（`- [ ] `）
+    传 2 空格。body 缩进 = indent + 2（`- ` 占 2 字符），使 body 留在子列表项内容区内
+    （CommonMark type-6 HTML block 不脱出——见下方折叠分支详注）。
 
     约束（用户 #168 续——「不能是动态获取，不能影响通过 api 获取全量 review 意见信息」）：
     summary 与 body 均静态嵌入 markdown（非动态获取，点击展开无网络请求）；全文始终在
@@ -129,14 +124,15 @@ def _render_reasoning(reasoning):
     纯函数：输入字符串，输出 markdown 片段（空输入返回空串）。"""
     if not reasoning:
         return ""
+    body_indent = " " * (len(indent) + 2)   # indent + "- " 2 字符 → body 留在子列表项内容区
     if len(reasoning) <= _REASONING_COLLAPSE_THRESHOLD:
-        return f"   - 依据：{reasoning}"
+        return f"{indent}- 依据：{reasoning}"
     # 折叠：summary 露字数 + 首句预览（关键信息），body 完整保留（author 需细节时展开）。
     # 用 f-string 而非 .format()：reasoning 含 { 或 } 时（代码片段/JSON 示例），
     # .format(body=reasoning) 虽不解析值里的 {}（值不被二次扫描），但 .format() 调用
     # 形态易让评审/读者误判会炸——f-string 直接内联，无此视觉歧义（评审两轮均提此点）。
     # return 串开头不带 \n：调用方 `"\n" + _render_reasoning(...)` 已加换行，与短依据分支
-    # （`f"   - 依据：..."` 开头也无 \n）保持一致——避免折叠分支双换行（评审第三轮提）。
+    # （`f"{indent}- 依据：..."` 开头也无 \n）保持一致——避免折叠分支双换行（评审第三轮提）。
     #
     # <details> 是 CommonMark type-6 HTML block，遇到空行即终止。此前 summary 与 body 之间、
     # body 与 </details> 之间各有一空行 → <details> 在第一个空行处被截断成孤立开标签，
@@ -150,159 +146,267 @@ def _render_reasoning(reasoning):
     # 机器可读的 <!-- touchstone-checklist --> marker 存的是 reasoning 原文，API 取全文不受影响。
     teaser = _reasoning_teaser(reasoning)
     body = re.sub(r"\s+", " ", reasoning).strip()
-    return (f"   - <details><summary>依据（{len(reasoning)} 字）：{teaser}</summary>\n"
-            f"   {body}\n"
-            f"   </details>")
+    # body 与 </details> 须缩进到与 <details> 同列（indent + 2：子列表项 "- " 占 2 字符）。
+    # 此前 body 缩进不足会让 body 脱出子列表项的内容区，CommonMark 判其不属于该列表项 →
+    # HTML block 在 body 行处截断 → <details> 变空壳、body 渲染成列表项外的松散段落（始终
+    # 可见）—— GitHub 实测 body_html 证实。缩进到 body_indent 让 body 留在子列表项内、
+    # HTML block 完整（#167/#168 回归修复，v2 参数化缩进以兼容编号列表与 task list）。
+    return (f"{indent}- <details><summary>依据（{len(reasoning)} 字）：{teaser}</summary>\n"
+            f"{body_indent}{body}\n"
+            f"{body_indent}</details>")
 
 
-def _finding_entry(i, f):
-    """单条发现的渲染（规则命中与 AI 建议共用）：位置 — 问题 + 修复方向/依据/达成判据 + 行尾元数据。
+# ---- v2 版面函数（2026-08 评审模板重设计：七段 → 六段，去冗余）-------------------------
+# v2 移除了 v1 的 _finding_entry / render_facts（含修改范围+规则命中）/ render_findings
+# （态势区+AI 评审）三函数——版面合并：态势区→render_status_line（①），AI 评审+清单→
+# render_findings_checklist（④），静态检查→render_facts_v2（③，去修改范围+规则命中）。
+# 状态标记/措辞从 checklist.py 迁入（呈现层常量归呈现层）。checklist.py 只保留数据层
+# （reconcile/parse/marker），可见渲染统一由 render.py 负责。
+_STATUS_MARK = {"open": "- [ ]", "done": "- [x]", "waived": "- [x]", "split": "- [x]"}
+_STATUS_LABEL = {"open": "⬜ 待处理", "done": "✅ 已复核销项",
+                 "waived": "🟡 待人核准（author 豁免）", "split": "🟡 待人核准（author 拆出）"}
 
-    字段去冗余（借鉴 pr-agent 上游 #2510 评审写作）：title 行已含 rationale（一句话问题），
-    修复方向若与 rationale 同文则不再复读（此前的「修复方向：<与标题完全相同的文字>」纯噪声）。
-    依据字段早有同等去重守卫（reasoning != rationale 才显示），本处补齐对称。"""
-    direction = f.get("fix_direction") or f.get("suggested_fix") or ""
-    reasoning = f.get("fix_reasoning") or ""
-    rationale = f.get("rationale") or ""
-    dc = f.get("done_criteria") or {}
-    _spec = dc.get("spec") or {}
-    if dc.get("kind") == "deterministic":
-        dc_line = f"规则 `{_spec.get('recheck', '?')}` 复检不再命中"
-    elif dc.get("kind") == "review":
+
+def _render_done_criteria(dc):
+    """达成判据行内容：deterministic=规则复检；review=人工复核问题。纯函数。"""
+    _spec = (dc or {}).get("spec") or {}
+    if (dc or {}).get("kind") == "deterministic":
+        return f"规则 `{_spec.get('recheck', '?')}` 复检不再命中"
+    if (dc or {}).get("kind") == "review":
         q = _spec.get("question", "")
-        # q 非空=有具体复核问题（设计意见 1 的复核判据，如「回滚路径是否覆盖跨模块调用失败」）；
-        # q 空=诚实降级（model 来源在 normalize 层给不出具体问题，不再用「{direction}是否已解决」
-        # 模板复读）。降级时如实描述 reconcile 实际机制：下一轮 sig 不再现即自动销项。
-        dc_line = f"需人工复核：{q}" if q else "下一轮复检不再命中即销项"
-    else:
-        dc_line = ""
-    e = f"{i}. **`{_location(f)}`** — {rationale}"
-    if direction and direction != rationale:
-        e += f"\n   - 修复方向：{direction}"
-    if reasoning and reasoning != rationale:
-        e += "\n" + _render_reasoning(reasoning)
-    if dc_line:
-        e += f"\n   - 达成判据：{dc_line}"
-    e += (f"\n   - <sub>`{f['rule_id']}` · {f.get('severity','')} · "
-          f"置信 {f['confidence']:.2f} · 来源 {f['agent']}</sub>")
-    return e
+        # q 非空=有具体复核问题；q 空=诚实降级（描述 reconcile 实际机制）。
+        return f"需人工复核：{q}" if q else "下一轮复检不再命中即销项"
+    return ""
 
 
-def render_facts(scope_facts, gate_line="", lineage=None, rule_findings=None):
-    """③ 静态检查区：不经 LLM 的确定性输出——修改范围 + 敏感路径命中 + 门禁 + 同源提示，
-    以及确定性【规则命中的逐条发现】（contract/stack/size，可复现）。与「AI 评审」段并列同级
-    H3，构成「确定性 vs LLM」两层视图。"""
-    if not scope_facts and not rule_findings:
+def _render_finding_meta(f):
+    """行尾元数据小字（rule/严重度/置信/来源）。task list 子项缩进 2 空格。
+    用 .get() 兜底：清单项可能源自只含部分字段的 finding（如测试夹具缺 confidence）。"""
+    conf = f.get("confidence")
+    conf_str = f"{conf:.2f}" if conf is not None else "—"
+    return (f"  - <sub>`{f.get('rule_id', '?')}` · {f.get('severity', '')} · "
+            f"置信 {conf_str} · 来源 {f.get('agent', '')}</sub>")
+
+
+def render_facts_v2(scope_facts, gate_line=""):
+    """③ v2 静态检查区：仅确定性事实——敏感路径命中 + 门禁状态。
+    修改范围与 PR UI 统计重复 → 删除（观测意见 7）。规则命中详情并入「评审发现与销项」段。
+    无内容（简单 PR 无敏感路径/无门禁）时整段省略——去恒定噪声。"""
+    if not scope_facts:
         return ""
-    lines = ["### 静态检查", ""]
-    if scope_facts and not scope_facts.get("parse_ok", True):
-        lines.append(f"- ⚠️ {scope_facts.get('parse_warning', 'diff 解析失败：范围事实未生效')}")
-        scope_facts = None      # 解析失败：跳过范围行，但仍渲染下方规则命中
-    if scope_facts:
-        t = scope_facts.get("totals", {})
-        lines.append(f"- 修改范围：{t.get('files', 0)} 个文件（+{t.get('added', 0)} / −{t.get('deleted', 0)} 行）")
-        hits = scope_facts.get("sensitive_hits", [])
-        if hits:
-            by_rule = {}
-            for h in hits:
-                by_rule.setdefault(h["rule"], []).append(h["path"])
-            for rule, paths in sorted(by_rule.items()):
-                shown = ", ".join(f"`{p}`" for p in paths[:5]) + ("…" if len(paths) > 5 else "")
-                lines.append(f"- 敏感路径命中（{rule}）：{shown}")
+    if not scope_facts.get("parse_ok", True):
+        return f"### 静态检查\n\n- ⚠️ {scope_facts.get('parse_warning', 'diff 解析失败：范围事实未生效')}"
+    lines = []
+    hits = scope_facts.get("sensitive_hits", [])
+    if hits:
+        by_rule = {}
+        for h in hits:
+            by_rule.setdefault(h["rule"], []).append(h["path"])
+        for rule, paths in sorted(by_rule.items()):
+            shown = ", ".join(f"`{p}`" for p in paths[:5]) + ("…" if len(paths) > 5 else "")
+            lines.append(f"- 敏感路径命中（{rule}）：{shown}")
+    if gate_line:
+        lines.append(f"- 门禁状态：{gate_line}")
+    if not lines:
+        return ""            # 只有修改范围（已删）→ 整段省略（观测意见 7：简单 PR 零噪声）
+    return "### 静态检查\n\n" + "\n".join(lines)
+
+
+def render_status_line(risk, loop_info=None, checklist=None, rounds_left=None,
+                       review_reliable=True):
+    """① v2 状态行（合并观测意见 1+6）：循环决策 + 轮次 + 销项率 + 风险等级 — 合成一行 blockquote，
+    替代旧版「横幅反馈循环行 + 态势风险行」两行。escalate 的 reason 有诊断价值（为何升级），保留；
+    continue/converged 的 reason 是对轮次/销项率的复述——已在状态行结构化呈现，不复读。"""
+    _RISK = {"high": "高", "mid": "中", "low": "低"}
+    _ACTION = {"read+arbitrate": "需人工评审后合入", "read": "建议人工过目", "skip": "无需人工介入"}
+    _DECISION = {"continue": "🔁 继续", "converged": "✅ 收敛", "escalate": "⬆️ 升级到人"}
+    _BLAST = {"cross_module_contract": "跨模块契约变更", "security_surface": "涉及安全面"}
+
+    parts = []
+    if loop_info:
+        decision = loop_info[0]
+        reason = loop_info[1] if len(loop_info) > 1 else ""
+        parts.append(_DECISION.get(decision, decision))
+        if decision == "escalate" and reason:
+            parts.append(reason)         # escalate reason 有诊断价值（为何升级），保留
+    cl = checklist or {}
+    if cl.get("round"):
+        round_part = f"第 {cl['round']} 轮"
+        if rounds_left is not None:
+            round_part += f" · 剩余 {rounds_left} 轮"
+        parts.append(round_part)
+    if cl.get("items") and cl.get("resolved_rate") is not None:
+        # 真值检查（非 `is not None`）：空清单 items=[] 时 resolved_rate=1.0（_rate 空列表
+        # 归一），若用 `is not None` 会漏过空列表显示「销项率 100%」——对零项清单是噪声，
+        # 与 v2 去冗余目标矛盾（PRA-GENERAL round-1）。空清单无项可销，不显示销项率。
+        rate = min(100, max(0, int(round(cl["resolved_rate"] * 100))))
+        parts.append(f"销项率 {rate}%")
+
+    band = _RISK.get(risk.get("risk_band"), "未定")
+    action = _ACTION.get(risk.get("human_action"), "建议人工过目")
+    if review_reliable:
+        parts.append(f"风险等级：{band} — {action}")
+    else:
+        parts.append(f"风险等级：{band}（LLM 评审不可信）— 需人工评审")
+
+    line = "> " + " · ".join(parts)
+    factors = "、".join(_BLAST.get(b, b) for b in (risk.get("blast_radius") or []))
+    if factors:                       # 无触发因子时不显「触发因子：无」——去冗余（观测意见 7 同纪律）
+        line += f"\n> **触发因子：** {factors}"
+    return line
+
+
+def render_findings_checklist(findings, checklist, review_reliable=True):
+    """④ v2 评审发现与销项（合并观测意见 2+3+4）：AI 评审 + 待解决问题清单合为一段。
+    所有发现（确定性规则命中 + LLM 建议）作为 - [ ] task list，每条含完整详情 + 销项状态。
+    保留 GitHub 原生 checkbox（用户明确要求）。sig 兼作位置与 ack 锚点（不再单列位置/锚点行）。
+    样板「销项跟踪：…见上方」删除（详情已在同段，观测意见 3）。
+
+    findings↔checklist 按 sig join：开放项有当前 finding（显示完整详情 + 最新 direction），
+    已销项项可能无当前 finding（用清单存储的 direction/reasoning 历史快照，sparse 显示）。
+    排序：开放项在前（按置信降序），已销项项在后（不再抢注意力）。"""
+    cl = checklist or {"round": 0, "items": [], "resolved_rate": 1.0}
+    items = cl.get("items", [])
+    if not items:
+        return ""    # 无清单项（干净 PR / 全销项）→ 整段省略（与 ③/⑤「无内容整段省略」纪律一致，
+                     # PRA-REVIEW round-2）。防静默故障溯源在 ② alerts 段（已端到端运行/0 条建议），
+                     # 不靠此处的恒定标题——此前「### 评审发现与销项\n本次无可自改发现。」是干净
+                     # PR 上的恒定噪声，与 v2 去冗余目标矛盾。
+
+    # findings↔清单项 join 用 sig 建索引。重复 sig（同 rule:file:line 的多条 finding）
+    # keep-first——与 from_findings 的去重（seen 集，keep-first）一致：清单项已是首条，
+    # 索引也取首条才不出现「清单用首条 direction、元数据却取末条」的错配（PRA-GENERAL round-5）。
+    finding_by_sig = {}
+    for f in (findings or []):
+        s = sig_of(f)
+        if s not in finding_by_sig:
+            finding_by_sig[s] = f
+
+    def _sort_key(it):
+        f = finding_by_sig.get(it["sig"])
+        conf = f.get("confidence", 0) if f else 0
+        return (0 if it["status"] == "open" else 1, -conf)
+
+    total = len(items)
+    n_open = sum(1 for it in items if it["status"] == "open")
+    capped = total > MAX_FINDINGS_IN_SUMMARY
+    head = f"### 评审发现与销项（共 {total} 条"
+    if n_open:
+        head += f"，待销项 {n_open}"
+    if capped:
+        head += f"，仅列前 {MAX_FINDINGS_IN_SUMMARY} 条"
+    head += "）"
+    lines = [head, ""]
+
+    # 封顶：大 PR 产出大量条目 → 列表封顶避免撑破 GitHub 65536 字符限。开放项优先（sort_key
+    # 使 open 排前），已销项项按预算余量跟进。超出部分折叠到尾注（完整清单在 marker 里有）。
+    shown = sorted(items, key=_sort_key)[:MAX_FINDINGS_IN_SUMMARY]
+    for it in shown:
+        f = finding_by_sig.get(it["sig"])
+        mark = _STATUS_MARK.get(it["status"], "- [ ]")
+        label = _STATUS_LABEL.get(it["status"], "")
+        # 开放项用当前发现的 direction（最新评审）；已销项用清单存储的（历史快照）
+        if f:
+            direction = f.get("fix_direction") or f.get("suggested_fix") or ""
+            rationale = f.get("rationale") or ""
+            reasoning = f.get("fix_reasoning") or ""
+            dc = f.get("done_criteria") or {}
         else:
-            lines.append("- 敏感路径命中：无")
-        if gate_line:
-            lines.append(f"- 门禁状态：{gate_line}")
-        if lineage and lineage.get("lineage"):
-            entries = [e for e in lineage.get("lineage", []) if isinstance(e, dict) and "number" in e]
-            if entries:
-                hist = "、".join(f"#{e['number']}" for e in entries)
-                lines.append(f"- ⚠️ 同源提示：与已关闭的 {hist} 内容同源，历史已消耗 "
-                         f"{lineage.get('rounds_spent', 0)} 轮、继承未销项 "
-                         f"{len(lineage.get('inherited_open_items', []))} 条，剩余轮次 "
-                         f"{lineage.get('rounds_left', '?')}（重置需 `rounds-reset` label）")
-    if rule_findings:
-        shown = rule_findings[:MAX_FINDINGS_IN_SUMMARY]
+            direction = it.get("direction") or ""
+            rationale = ""
+            reasoning = it.get("reasoning") or ""
+            dc = it.get("done_criteria") or {}
+        # 标题：方向作标题（加粗）。无方向时按状态区分占位——open 项「待补」提示 author 补方向；
+        # 已销项项（done/waived/split）方向是历史快照、本就可能未留存，「待补」会误导（待补=待办，
+        # 但已销项无需再补）→ 标「已销项」（PRA-REVIEW round-3 data-loss）。
+        if direction:
+            title = f"**{direction}**"
+        elif it["status"] == "open":
+            title = "（待补修复方向）"
+        else:
+            title = "（已销项）"
+        lines.append(f"{mark} {title}" + (f" {label}" if label else "") + f" — `{it['sig']}`")
+        # rationale（问题陈述）作首条子项；与 direction 同文则省（去冗余，同 _finding_entry 纪律）
+        if rationale and rationale != direction:
+            lines.append(f"  - {rationale}")
+        # reasoning（依据）与 rationale 或 direction 同文则省——成对去冗余（PRA-REVIEW round-4：
+        # 已销项项 rationale="" 时 `reasoning != ""` 恒真，若 reasoning==direction 会复读标题，
+        # 补 `!= direction` 守卫使两分支（open 有 finding / resolved 无 finding）去冗余一致）。
+        if reasoning and reasoning != rationale and reasoning != direction:
+            r = _render_reasoning(reasoning, indent="  ")   # task list 子项缩进 2 空格
+            if r:
+                lines.append(r)
+        dc_line = _render_done_criteria(dc)
+        if dc_line:
+            lines.append(f"  - 达成判据：{dc_line}")
+        if it.get("note"):
+            lines.append(f"  - 说明：{it['note']}")
+        if it.get("guard"):                    # 守卫事实（issue #139）：确定性 AST 事实，供 waived 佐证
+            lines.append(f"  - 守卫事实：{it['guard']}")
+        if f:
+            lines.append(_render_finding_meta(f))
+    if capped:
         lines.append("")
-        lines.append("#### 规则命中（可复现）")
-        lines.append("")
-        for i, f in enumerate(shown, 1):
-            lines.append(_finding_entry(i, f))
-        if len(rule_findings) > MAX_FINDINGS_IN_SUMMARY:
-            lines.append("")
-            lines.append(f"……另有 {len(rule_findings) - MAX_FINDINGS_IN_SUMMARY} 条（确定性核对已覆盖全文，见 check 标题/总闸）。")
+        lines.append(f"……另有 {total - MAX_FINDINGS_IN_SUMMARY} 条（超列表上限，完整清单见 marker）。")
     return "\n".join(lines)
 
 
-def render_findings(risk, findings, review_reliable=True):
-    """②态势区 + ④「AI 评审」（仅 LLM 发现）。
-    态势区：「标签 + 人话」陈述行——风险等级（含"该怎么办"）与触发因子；verification_decision
-      机器路由字段不入此区，降到「验证与日志」。
-    AI 评审：仅 LLM（pr-agent）发现；确定性规则命中的逐条发现归「静态检查」段（render_facts）。
-      `findings` 入参此处即为全部发现，函数内按来源过滤只渲染 LLM 部分。"""
-    _RISK = {"high": "高", "mid": "中", "low": "低"}
-    _ACTION = {"read+arbitrate": "需人工评审后合入", "read": "建议人工过目",
-               "skip": "无需人工介入"}
-    _BLAST = {"cross_module_contract": "跨模块契约变更", "security_surface": "涉及安全面"}
-    band = _RISK.get(risk.get("risk_band"), "未定")
-    action = _ACTION.get(risk.get("human_action"), "建议人工过目")
-    factors = "、".join(_BLAST.get(b, b) for b in (risk.get("blast_radius") or []))
-    if review_reliable:
-        head = [f"> **风险等级：{band}** — {action}"]
-    else:
-        head = [f"> **风险等级：{band}** <sub>（仅确定性信号，LLM 评审不可信）</sub>"
-                " — 需人工评审，原 AI 建议不采信"]
-    if factors:                       # 无触发因子时不显「触发因子：无」——去冗余
-        head.append(f"> **触发因子：** {factors}")
-
-    ai_based = [f for f in (findings or []) if str(f.get("agent", "")).startswith("pr-agent")]
-    total = len(ai_based)
-    if not ai_based:
-        return "\n".join(head), "### AI 评审\n\n本次 LLM 未提出建议。"
-    cap = (f"，仅列前 {MAX_FINDINGS_IN_SUMMARY} 条" if total > MAX_FINDINGS_IN_SUMMARY else "")
-    body = [f"### AI 评审（共 {total} 条{cap}）", ""]
-    for i, f in enumerate(sorted(ai_based, key=lambda x: -x.get("confidence", 0))[:MAX_FINDINGS_IN_SUMMARY], 1):
-        body.append(_finding_entry(i, f))
-    if total > MAX_FINDINGS_IN_SUMMARY:
-        body.append("")
-        body.append(f"……另有 {total - MAX_FINDINGS_IN_SUMMARY} 条（超列表上限）。")
-    return "\n".join(head), "\n".join(body)
+def render_reference(verification_blocks=None, has_checklist_items=False):
+    """⑤ v2 参考信息（观测意见 5）：验证/日志 + 申报指引，全部 <details> 折叠（默认不占屏）。
+    无内容时整段省略。<details> 是 CommonMark type-6 HTML block——summary/body/</details>
+    之间不得有空行（#168 回归）；行内 code 用 <code> 标签（HTML block 不解析 markdown）。"""
+    blocks = []
+    if verification_blocks:
+        content = "\n\n".join(verification_blocks)
+        blocks.append(f"<details><summary>验证与日志</summary>\n{content}\n</details>")
+    if has_checklist_items:
+        blocks.append("<details><summary>如何申报销项</summary>\n"
+                      "发评论，内容为 <code>touchstone-ack</code> 代码块，每行 "
+                      "<code>&lt;签名&gt;: done|waived: 理由|split: 链接</code>。"
+                      "勾选/申报是输入信号，以评审方按达成判据复核后的本清单为准。\n"
+                      "</details>")
+    if not blocks:
+        return ""
+    return "### 参考信息\n\n" + "\n\n".join(blocks)
 
 
-def render_report(risk, findings, banner="", scope_facts=None, checklist_md="",
-                  verification_md="", markers="", gate_line="", lineage=None,
+def render_report(risk, findings, alerts="", scope_facts=None, checklist=None,
+                  rounds_left=None, loop_info=None, verification_blocks=None,
+                  markers="", gate_line="",
                   review_reliable=True, engine_status="ok", ai_raw_count=0, added_lines=0,
                   engine_detail=""):
-    """按七段版面模板填充评审报告（修订设计 §3 意见 4）。版面由模板唯一定义。"""
-    head, findings_md = render_findings(risk, findings, review_reliable=review_reliable)
-    summary_line = head          # ② 态势表：风险与建议动作一眼扫读
-    rule_findings = [f for f in (findings or []) if not str(f.get("agent", "")).startswith("pr-agent")]
-    # ① 状态横幅（降级说明/循环状态/0-发现溯源）统一 blockquote——与正文视觉区隔；
-    #    评审不可信时 [!CAUTION] 告警置顶【替代】常规横幅的降级/溯源部分（原因已并入
-    #    告警，避免同一信息两处重复），循环状态行仍保留在告警之后。
+    """v2 六段版面（模板唯一定义，代码只填充）：
+      ① 标题 + 状态行（循环 + 风险合一，观测意见 1+6）
+      ② 告警（降级/CAUTION/溯源/同源提示，blockquote）
+      ③ 静态检查（敏感路径/门禁，简单 PR 整段省略——观测意见 7）
+      ④ 评审发现与销项（AI 评审 + 清单合一 - [ ] task list——观测意见 2+3+4）
+      ⑤ 参考信息（验证/日志 + 申报指引，<details> 折叠——观测意见 5）
+      ⑥ 机器 marker
+    alerts 取代旧 banner 参数（不再含循环行——循环行归①状态行）。"""
+    status = render_status_line(risk, loop_info, checklist, rounds_left, review_reliable)
+    # ② 告警：不可信时 [!CAUTION] 置顶替代降级横幅；其余告警（det/llm/unverified/telemetry/
+    # 溯源/同源提示）作为 blockquote 追加。可信时直接逐行包 blockquote。
     if not review_reliable:
-        # 不可信时 [!CAUTION] 告警置顶替代降级/溯源部分（原因已并入告警，避免重复）。
-        # 但 banner 可能还载有与可信度无关的内容（det_warning/llm_notes/unverified_claims
-        # 及循环状态行）--这些不能丢，作为 blockquote 追加在告警之后（pr-agent 评审意见：
-        # 不可信时整块 banner 被丢弃会静默丢失重要通知）。
         kept = []
-        if banner:
-            for ln in banner.split("\n"):
+        if alerts:
+            for ln in alerts.split("\n"):
                 if not ln.strip():
                     continue
                 kept.append(ln)
-        banner = render_unreliable_callout(engine_status, ai_raw_count, added_lines, engine_detail)
+        alerts_md = render_unreliable_callout(engine_status, ai_raw_count, added_lines, engine_detail)
         if kept:
-            banner += "\n\n" + "\n".join(("> " + ln if not ln.startswith(">") else ln) for ln in kept)
-    elif banner:
-        banner = "\n".join(("> " + ln if ln.strip() else ">") for ln in banner.split("\n"))
+            alerts_md += "\n\n" + "\n".join(("> " + ln if not ln.startswith(">") else ln) for ln in kept)
+    elif alerts:
+        alerts_md = "\n".join(("> " + ln if ln.strip() else ">") for ln in alerts.split("\n"))
+    else:
+        alerts_md = ""
+    has_items = bool((checklist or {}).get("items"))
     parts = {
-        "banner": banner or "",
-        "summary_line": summary_line,
-        "facts": render_facts(scope_facts, gate_line, lineage, rule_findings=rule_findings) if (scope_facts or rule_findings) else "",
-        "findings": findings_md,
-        "checklist": checklist_md or "",
-        "verification": verification_md or "",
+        "status": status,
+        "alerts": alerts_md,
+        "facts": render_facts_v2(scope_facts, gate_line) if scope_facts else "",
+        "findings": render_findings_checklist(findings, checklist, review_reliable),
+        "reference": render_reference(verification_blocks, has_items),
         "markers": markers or "",
     }
     out = _fill_template(_load_template(), parts)   # 单遍填充（A2-F1）：不重扫已填入内容，防占位符注入

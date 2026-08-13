@@ -84,17 +84,17 @@ def test_sec001_catches_secret_beyond_old_truncation_point(monkeypatch):
 
 
 def test_render_summary_caps_findings_to_avoid_comment_overflow():
-    """大 PR 产出大量发现 → 摘要封顶列出，超出折叠，避免超 GitHub 65536 字符限。"""
-    from touchstone import orchestrator as orc
-    risk = {"risk_band": "low", "human_action": "skip", "verification_decision": "cheap_only",
-            "blast_radius": []}
+    """大 PR 产出大量发现 → 评审发现与销项段封顶列出，超出折叠，避免超 GitHub 65536 字符限。
+    v2：封顶逻辑在 render_findings_checklist（合并段）。"""
+    from touchstone import render, checklist as cl
     findings = [{"rule_id": f"R{i}", "agent": "pr-agent", "severity": "warn", "confidence": 0.5,
                  "file": "a.py", "line": i, "rationale": "x", "suggested_fix": "y"}
                 for i in range(500)]
-    _head, body = orc.render_findings(risk, findings)
+    c = cl.from_findings(findings)
+    body = render.render_findings_checklist(findings, c)
     assert "另有" in body and "仅列前" in body
     assert len(body) < 65536                        # 评论体不超限
-    assert body.count("`R") <= LB.MAX_FINDINGS_IN_SUMMARY + 1   # 列出的不超过封顶
+    assert body.count("- [ ]") <= LB.MAX_FINDINGS_IN_SUMMARY   # 列出的不超过封顶
 
 
 # ---------------- 体量门禁（SIZE-001）----------------

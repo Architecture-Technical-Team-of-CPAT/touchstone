@@ -55,21 +55,36 @@ RESOLVED = VERIFIED | CLAIMED
 
 
 def _norm_sig(sig):
-    """规整清单签名：去除所有空白（含换行/制表符/首尾空格）。
+    """规整清单签名：去除所有空白（含换行/制表符/首尾空格）+ 剥除 legacy `:None` 行段。
 
     sig = rule_id:file:line，各段本不含合法空格，故全去空白安全。防 pr-agent 输出的
     file/line 字段带尾换行（见 PR #52 advisory 的 PRA-POSSIBLE_ISSUE）——未归一化时 sig 内嵌
     \\n，而 author 的 touchstone-ack 经 splitlines()+strip() 产不出含内部换行的 sig，导致
     acks.get(item_sig) 恒 None、显式 done/waived/split 申报永远匹配不上该项（structurally
     无法销项，只能走复检自动销项）。归一化在构造（sig_of）与加载（reconcile 读旧 marker）
-    两端一致施加，使含脏空白的旧清单项也能被 ack 命中。"""
-    return re.sub(r"\s+", "", sig or "")
+    两端一致施加，使含脏空白的旧清单项也能被 ack 命中。
+
+    legacy `:None` 剥除（PRA-REVIEW round-3）：v2 前 sig_of 在 line=None 时产 `rule:file:None`，
+    v2 改为省略行段（`rule:file`）。旧 marker/ack 的 `:None` sig 与新 sig 不匹配会导致跨版
+    reconcile orphan（旧项永远销不掉）。中心化剥除：count(':')>=2（即 rule:file:line 三段格式）
+    且 endswith(':None') 时剥后缀——只命中【行段=None】的 legacy 形态，不误伤 file=None
+    （`rule:None` 只一段冒号、不剥）。"""
+    s = re.sub(r"\s+", "", sig or "")
+    if s.endswith(":None") and s.count(":") >= 2:
+        s = s[:-5]       # 剥 legacy 行段 None（rule:file:None → rule:file），使旧/新 sig 可匹配
+    return s
 
 
 def sig_of(finding):
     """清单项签名——与 loop._sig 同构（rule_id:file:line），保证两处对同一发现的指认一致。
-    构造即归一化（_norm_sig）：防 file/line 带尾换行等脏空白渗入签名。"""
-    return _norm_sig(f"{finding.get('rule_id')}:{finding.get('file')}:{finding.get('line')}")
+    构造即归一化（_norm_sig）：防 file/line 带尾换行等脏空白渗入签名。
+    line 为 None 时省略行段（rule_id:file）——v2 起 sig 兼作版面显示的位置串（不再单列
+    `_location` 行），须在 sig 层就防 `file:None` 字面量渗入显示（原 render._location 渲染侧
+    兜底随 v1 版面移除，防 `:None` 的职责上移到本构造源，一处修两处一致）。"""
+    line = finding.get("line")
+    if line is None:
+        return _norm_sig(f"{finding.get('rule_id')}:{finding.get('file')}")
+    return _norm_sig(f"{finding.get('rule_id')}:{finding.get('file')}:{line}")
 
 
 def from_findings(findings, round_no=1):
@@ -234,60 +249,18 @@ def no_progress(prev, cur):
     return _n(cur) <= _n(prev) and _ws(cur) <= _ws(prev)
 
 
-_STATUS_MARK = {"open": "- [ ]", "done": "- [x]", "waived": "- [x]", "split": "- [x]"}
-# 易读性改版·二：措辞统一，一项一态。done=机器复核过；waived/split=author 自证待人核准。
-_STATUS_LABEL = {"open": "⬜ 待处理", "done": "✅ 已复核销项",
-                 "waived": "🟡 待人核准（author 豁免）", "split": "🟡 待人核准（author 拆出）"}
+# v2（2026-08 评审模板重设计）：可见渲染（task list + 申报指引 + 同源提示）全部迁至
+# render.py（render_findings_checklist / render_status_line / render_reference / render_facts_v2）。
+# 本模块只保留数据层：reconcile / parse / marker。状态标记/措辞常量也已迁至 render.py
+# （呈现层常量归呈现层）。本模块只产机读 marker（render_marker）。
 
 
-def render(checklist, rounds_left=None, lineage=None):
-    """生成置顶评论正文：task list（人可读）+ 隐藏 JSON marker（权威状态，机器可读）。
-    lineage：轮次台账的同源提示（评审意见 10），有则在头部明示历史欠账。"""
+def render_marker(checklist):
+    """v2：只产机读 marker（权威状态 JSON），不产可见渲染——可见渲染由 render.render_findings_checklist
+    统一负责（合并 AI 评审 + 清单）。marker 放报告 ⑥ 机器 marker 段，与 loop/result marker 并列。
+    纯函数：输入 checklist 对象，输出 `<!-- touchstone-checklist: JSON -->` 字符串。"""
     cl = checklist or {"round": 0, "items": [], "resolved_rate": 1.0}
-    # 版面铁律（易读性改版）：品牌名只在报告 H2 标题出现一次，本段与③④⑥并列用 H3；
-    # 每轮重复的申报方式样板折叠进 <details>，不占屏。
-    lines = [f"### 待解决问题清单（第 {cl['round']} 轮 · 销项率 "
-             f"{min(100, max(0, int(round(cl.get('resolved_rate', 0) * 100))))}%"
-             + (f" · 剩余轮次 {rounds_left}" if rounds_left is not None else "") + "）"]
-    if lineage and lineage.get("lineage"):
-        hist = "、".join(f"#{e['number']}（{e['rounds']} 轮）" for e in lineage["lineage"])
-        lines.append(f"> ⚠️ 与已关闭的 {hist} 内容同源：历史已消耗 {lineage.get('rounds_spent', 0)} 轮，"
-                     f"未销项 {len(lineage.get('inherited_open_items', []))} 条已并入本清单，"
-                     f"剩余轮次按台账计。人工重置请打 `rounds-reset` label。")
-    lines.append("")
-    if cl["items"]:
-        # 去重：本清单是「销项状态跟踪」，不重复「静态检查 / AI 评审」的详情——每条只给
-        # 状态 + 方向 + 位置 + 销项备注；问题依据与达成判据见上方评审各段。
-        lines.append("<sub>销项跟踪：每条的问题依据与达成判据见上方「静态检查 / AI 评审」，此处只跟踪状态。</sub>")
-        lines.append("")
-    for it in cl["items"]:
-        mark = _STATUS_MARK.get(it["status"], "- [ ]")
-        label = _STATUS_LABEL.get(it["status"], "")
-        direction = it.get("direction") or ""
-        loc = it["sig"].split("@", 1)[-1] if "@" in it["sig"] else it["sig"]
-        title = f"**{direction}**" if direction else "（待补修复方向）"
-        head = f"{mark} {title}" + (f" {label}" if label else "")
-        lines.append(head)
-        lines.append(f"  - 位置：`{loc}`")
-        if it["note"]:
-            lines.append(f"  - 说明：{it['note']}")
-        if it.get("guard"):                    # 守卫事实（issue #139）：确定性 AST 事实，
-            lines.append(f"  - 守卫事实：{it['guard']}")   # 供 waived 申报佐证与人工核对
-        lines.append(f"  <sub>锚点 `{it['sig']}`</sub>")
-    lines.append("")
-    if cl["items"]:
-        # 空清单（0 发现即收敛，如 PR #70）无项可申报——折叠样板此时纯噪声，省去。
-        # 有项时仍显申报指引（test_report_layout_invariants 锁非空情形）。
-        lines.append("<details><summary>如何申报销项</summary>")
-        lines.append("")
-        lines.append("发评论，内容为 ```touchstone-ack``` 代码块，每行 "
-                     "`<签名>: done|waived: 理由|split: 链接`。勾选/申报是输入信号，"
-                     "以评审方按达成判据复核后的本清单为准。")
-        lines.append("")
-        lines.append("</details>")
-        lines.append("")
-    lines.append(_OPEN + json.dumps(cl, ensure_ascii=False) + _CLOSE)
-    return "\n".join(lines)
+    return _OPEN + json.dumps(cl, ensure_ascii=False) + _CLOSE
 
 
 def parse_latest(bodies):

@@ -968,12 +968,11 @@ def normalize(items, nmap=None):
             reasoning = ""            # 说明文字与方向重复时不复读
         # line_start 缺失时回退 line_end（借鉴 pr-agent 上游 #2510 评审定位精度）：
         # pr-agent review 类的 key_issues 偶不带 start_line 但带 end_line；此前 line=None
-        # → 渲染 `file:None` + sig 含 `:None` 字面量。line_end 回退让 sig 有真实行号、
-        # 跨轮 reconcile 更稳（行号稳定而非全部塌缩到 :None）。两层兜底：此处取值 +
-        # render._location 渲染侧仍防 `:None`。
+        # → sig 含 `:None` 字面量（v2 sig 兼作位置显示，会渗入版面）。line_end 回退让 sig
+        # 有真实行号、跨轮 reconcile 更稳（行号稳定而非全部塌缩到无行号）。两层兜底：此处
+        # 取值 + checklist.sig_of 构造侧 line=None 时省略行段（防 `:None` 渗入显示）。
         # 用 `is not None` 而非 `or`：line_start=0 虽罕见（GitHub diff 行号 1-based），
-        # 但 0 是 falsy，`or` 会错误跳过 0 回退到 line_end。与 render._location 的
-        # `is not None` 检查保持一致（两侧同样的 None 判定逻辑）。
+        # 但 0 是 falsy，`or` 会错误跳过 0 回退到 line_end。与 sig_of 的 None 判定逻辑一致。
         ls = it.get("line_start")
         line = ls if ls is not None else it.get("line_end")
         findings.append({

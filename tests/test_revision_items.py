@@ -115,28 +115,18 @@ def test_review_done_criteria_renders_honest_degradation():
 
     设计意见 1 要求 review 类带「一句可回答的具体复核问题」（示例：回滚路径是否覆盖跨模块
     调用失败）。normalize 层给不出 → 诚实留空。渲染层退为「下一轮复检不再命中即销项」
-    （reconcile 实际机制：sig 不再现即自动销项）。对比：确定性来源渲染「规则 X 复检不再命中」。"""
-    from touchstone.render import _finding_entry
+    （reconcile 实际机制：sig 不再现即自动销项）。对比：确定性来源渲染「规则 X 复检不再命中」。
+    v2：达成判据行由纯函数 _render_done_criteria 产出（从 _finding_entry 抽出，合并段复用）。"""
+    from touchstone.render import _render_done_criteria
     # model 来源：question 空 → 诚实降级
-    f_model = {"rule_id": "PRA-X", "file": "a.py", "line": 1, "rationale": "问题",
-               "fix_direction": "方向", "fix_reasoning": "",
-               "done_criteria": {"kind": "review", "spec": {"question": ""}},
-               "severity": "warn", "confidence": 0.7, "agent": "pr-agent:review"}
-    entry = _finding_entry(1, f_model)
-    assert "下一轮复检不再命中即销项" in entry
-    assert "是否已按方向解决" not in entry             # 不复读 direction
+    dc_model = {"kind": "review", "spec": {"question": ""}}
+    assert _render_done_criteria(dc_model) == "下一轮复检不再命中即销项"
     # 带具体复核问题的 review（如 guard_context / 未来 prompt 工程产出）→ 渲染「需人工复核」
-    f_specific = dict(f_model, done_criteria={"kind": "review",
-                                              "spec": {"question": "回滚路径是否覆盖跨模块调用失败？"}})
-    entry2 = _finding_entry(1, f_specific)
-    assert "需人工复核：回滚路径是否覆盖跨模块调用失败？" in entry2
+    dc_specific = {"kind": "review", "spec": {"question": "回滚路径是否覆盖跨模块调用失败？"}}
+    assert _render_done_criteria(dc_specific) == "需人工复核：回滚路径是否覆盖跨模块调用失败？"
     # 确定性来源不变：规则复检
-    f_det = {"rule_id": "SCOPE-001", "file": "a.py", "line": 1, "rationale": "越界",
-             "fix_direction": "收进 docs/", "fix_reasoning": "",
-             "done_criteria": {"kind": "deterministic", "spec": {"recheck": "SCOPE-001"}},
-             "severity": "warn", "confidence": 1.0, "agent": "contract-check"}
-    entry3 = _finding_entry(1, f_det)
-    assert "规则 `SCOPE-001` 复检不再命中" in entry3
+    dc_det = {"kind": "deterministic", "spec": {"recheck": "SCOPE-001"}}
+    assert _render_done_criteria(dc_det) == "规则 `SCOPE-001` 复检不再命中"
 
 
 # ---------------- 意见 3：收敛清单 ----------------
@@ -149,7 +139,7 @@ def _finding(rid, file="a.py", line=1, direction="改这里", kind="deterministi
 
 # ---------------- 借鉴 pr-agent #2510：折叠长依据 ----------------
 def _rf(rid, rationale="问题", direction="方向", reasoning="", line=1):
-    """render._finding_entry 用的最小 finding dict。"""
+    """render.render_findings_checklist 用的最小 finding dict（v2：合并段单发现驱动）。"""
     return {"rule_id": rid, "file": "a.py", "line": line, "rationale": rationale,
             "fix_direction": direction, "fix_reasoning": reasoning,
             "done_criteria": {"kind": "review", "spec": {"question": "?"}},
@@ -157,28 +147,28 @@ def _rf(rid, rationale="问题", direction="方向", reasoning="", line=1):
 
 
 def test_short_reasoning_rendered_inline():
-    """短依据（≤200 字符）平铺不折叠——短依据是快速判读信号，折叠反而增操作。"""
-    from touchstone.render import _finding_entry
+    """短依据（≤200 字符）平铺不折叠——短依据是快速判读信号，折叠反而增操作。
+    v2：_render_reasoning 是纯函数（indent 参数化），直接断言其输出（原经 _finding_entry 间接测）。"""
+    from touchstone.render import _render_reasoning
     short = "这是一条短依据。" * 5   # ~45 字符
-    f = _rf("PRA-X", reasoning=short)
-    entry = _finding_entry(1, f)
-    assert f"   - 依据：{short}" in entry
-    assert "<details>" not in entry
+    out = _render_reasoning(short, indent="  ")    # task list 子项缩进 2 空格
+    assert f"  - 依据：{short}" in out
+    assert "<details>" not in out
 
 
 def test_long_reasoning_collapsed_into_details():
     """长依据（>200 字符）折叠进 <details>——降低清单视觉噪声（借鉴 pr-agent #2510）。
 
     author 一眼扫清单只看标题+方向；需要依据细节时再点开。pr-agent 上游 #2510 同样把
-    Issue description / Issue Context 放 <details> 折叠，默认只露标题 + 一句后果。"""
-    from touchstone.render import _finding_entry, _TEASER_MAX
+    Issue description / Issue Context 放 <details> 折叠，默认只露标题 + 一句后果。
+    v2：_render_reasoning 纯函数直接断言（indent 参数化兼容编号列表与 task list）。"""
+    from touchstone.render import _render_reasoning, _TEASER_MAX
     long = "x" * 250
-    f = _rf("PRA-X", reasoning=long)
-    entry = _finding_entry(1, f)
-    assert "<details>" in entry and "</details>" in entry
-    assert f"依据（{len(long)} 字）" in entry             # summary 露字数
-    assert long[:_TEASER_MAX] in entry                     # summary 露前 60 字（关键信息预览）
-    assert long in entry                                   # 全文在 details body 内（API 取全文不变）
+    out = _render_reasoning(long, indent="  ")
+    assert "<details>" in out and "</details>" in out
+    assert f"依据（{len(long)} 字）" in out             # summary 露字数
+    assert long[:_TEASER_MAX] in out                    # summary 露前 60 字（关键信息预览）
+    assert long in out                                  # 全文在 details body 内（API 取全文不变）
 
 
 def test_details_summary_shows_first_sentence_teaser():
@@ -259,68 +249,107 @@ def test_details_block_has_no_blank_lines_inside():
         "<details> 块内含空行 → HTML block 在首个空行处截断，折叠失效（#167 回归）")
 
 
+def test_details_body_indented_to_sublist_content_column():
+    """回归 PR #171 review（fetchBody HTML 诊断）：<details> 在 `   - ` 子列表项里（col 5），
+    body 与 </details> 此前在 col 3（脱出子列表项内容区）→ CommonMark 判 body 不属于该列表项
+    → HTML block 在 body 行处截断 → <details> 变空壳、body 渲染成列表项外的松散段落（始终
+    可见、折叠失效）。body 与 </details> 须缩进到 col 5（与 <details> 同列）留在子列表项内。
+
+    检查 GitHub body_html 证实：修前 <details>summary 后紧跟 </details>（空壳）、body 在
+    </details> 之外作为兄弟段落；修后 body 在 <details> 内。"""
+    from touchstone.render import _render_reasoning
+    out = _render_reasoning("依据正文内容。" * 30)            # > 200 字符，触发折叠
+    lines = out.split("\n")
+    # 第一行：`   - <details><summary>...`（col 3 缩进 + "- " + <details> at col 5）
+    assert lines[0].startswith("   - <details>")
+    # body 行（第二行）与 </details> 行（第三行）须在 col 5（5 空格），与 <details> 同列
+    # 关键：修前是 3 空格（col 3）→ 脱出 `- ` 子列表项内容区（col ≥5）→ HTML block 截断、
+    # body 渲染到折叠区外（GitHub body_html 实测：details 空壳 + body 作兄弟段落）
+    body_indent = len(lines[1]) - len(lines[1].lstrip())
+    close_indent = len(lines[2]) - len(lines[2].lstrip())
+    assert body_indent >= 5, (
+        f"body 缩进 {body_indent} < 5 → 脱出 `- ` 子列表项内容区 → HTML block 截断、折叠失效")
+    assert close_indent >= 5 and lines[2].strip() == "</details>"
+
+
+def test_ack_help_details_has_no_blank_lines_inside():
+    """回归 #171：如何申报销项 <details> 内有空行（summary/body 间、body/</details> 间各一）
+    → CommonMark type-6 HTML block 在首个空行处截断 → <details> 变空壳、申报指引正文渲染成
+    <details> 之外的松散段落（始终可见）。去空行让整段留在同一 HTML block 内才可折叠。
+    v2：申报指引迁至 render_reference（参考信息段）。"""
+    from touchstone import render
+    md = render.render_reference(verification_blocks=None, has_checklist_items=True)
+    assert "<details>" in md and "</details>" in md
+    block = md[md.index("<details>"):md.index("</details>") + len("</details>")]
+    assert "\n\n" not in block, (
+        "<details> 内含空行 → HTML block 截断、申报指引正文跑到折叠区外（始终可见）")
 
 
 
 def test_reasoning_equal_to_rationale_not_rendered():
-    """依据与 rationale 同文时不渲染（既有去重守卫，折叠改动不破坏此不变式）。"""
-    from touchstone.render import _finding_entry
+    """依据与 rationale 同文时不渲染（既有去重守卫，折叠改动不破坏此不变式）。
+    v2：去重在 render_findings_checklist（合并段），经 from_findings 构造清单驱动断言。"""
+    from touchstone import render
     same = "同文" * 150                                   # rationale 与 reasoning 完全相同（>200 字符）
     f = _rf("PRA-X", rationale=same, direction="方向", reasoning=same)
-    entry = _finding_entry(1, f)
-    assert "依据" not in entry                            # 与 rationale 同文→不渲染
-    assert "<details>" not in entry
+    body = render.render_findings_checklist([f], cl.from_findings([f]))
+    assert "依据" not in body                            # 与 rationale 同文→不渲染
+    assert "<details>" not in body
 
 
 def test_empty_reasoning_omitted():
-    """空依据不渲染（既不显式露行也不显式露 details）。"""
-    from touchstone.render import _finding_entry
+    """空依据不渲染（既不显式露行也不显式露 details）。
+    v2：经 render_findings_checklist 驱动（合并段是依据渲染的唯一入口）。"""
+    from touchstone import render
     f = _rf("PRA-X", reasoning="")
-    entry = _finding_entry(1, f)
-    assert "依据" not in entry and "<details>" not in entry
+    body = render.render_findings_checklist([f], cl.from_findings([f]))
+    assert "依据" not in body and "<details>" not in body
 
 
 # ---------------- 借鉴 pr-agent #2510：字段去冗余 + 定位精度 ----------------
 def test_finding_entry_omits_direction_when_equal_to_rationale():
     """修复方向与 rationale 同文时不复读（去字段冗余）。
 
-    pr-agent 归一化层 normalize() 对 model 来源 finding 设 rationale=fix_direction=summary，
-    此前渲染为「标题=rationale」+「修复方向：rationale」（完全重复=纯噪声）。
-    借鉴 pr-agent 上游 #2510 评审写作：标题已含一句话问题，方向同文即不再单列。"""
-    from touchstone.render import _finding_entry
+    pr-agent 归一化层 normalize() 对 model 来源 finding 设 rationale=fix_direction=summary。
+    v1 渲染为「标题=rationale」+「修复方向：rationale」（完全重复=纯噪声）；v2 标题即方向，
+    rationale 与方向同文时子项省略——同一去冗余纪律、不同呈现（借鉴 pr-agent #2510）。"""
+    from touchstone import render
     f = {"rule_id": "PRA-X", "file": "a.py", "line": 5, "rationale": "边界未处理",
          "fix_direction": "边界未处理", "fix_reasoning": "",
          "done_criteria": {"kind": "review", "spec": {"question": "?"}},
          "severity": "warn", "confidence": 0.7, "agent": "pr-agent:review"}
-    entry = _finding_entry(1, f)
-    assert entry.count("边界未处理") == 1           # 标题里出现一次，不再复读
-    assert "修复方向" not in entry                  # 同文→整行省略
+    body = render.render_findings_checklist([f], cl.from_findings([f]))
+    assert body.count("边界未处理") == 1           # 标题里出现一次，不再复读
+    assert "**边界未处理**" in body               # v2：方向作标题（加粗）
 
 
 def test_finding_entry_keeps_direction_when_distinct_from_rationale():
-    """确定性来源 rationale≠fix_direction → 修复方向保留（去冗余不误杀信息）。"""
-    from touchstone.render import _finding_entry
+    """确定性来源 rationale≠fix_direction → 修复方向保留（去冗余不误杀信息）。
+    v2：方向作标题（加粗）、rationale 作首条子项，两者不同则都显示。"""
+    from touchstone import render
     f = {"rule_id": "SCOPE-001", "file": "a.py", "line": 1, "rationale": "改动越界",
          "fix_direction": "收到 docs/ 下", "fix_reasoning": "",
          "done_criteria": {"kind": "deterministic", "spec": {"recheck": "SCOPE-001"}},
          "severity": "warn", "confidence": 1.0, "agent": "contract-check"}
-    entry = _finding_entry(1, f)
-    assert "修复方向：收到 docs/ 下" in entry       # 不同→保留
+    body = render.render_findings_checklist([f], cl.from_findings([f]))
+    assert "**收到 docs/ 下**" in body            # 方向作标题（加粗）
+    assert "改动越界" in body                      # rationale 作子项（不同→保留）
 
 
 def test_finding_entry_no_colon_None_when_line_missing():
-    """行号缺失时不渲染 `file:None`（定位精度）。
+    """行号缺失时 sig 不含 `:None` 字面量（定位精度 + ack 锚点洁净）。
 
-    pr-agent review 类偶不返回 start_line → line=None → 此前 f.get('line','?') 得 None
-    （键在值 None，default 不生效）渲染 `a.py:None`。应退为只显示文件名。"""
-    from touchstone.render import _finding_entry
+    pr-agent review 类偶不返回 start_line → line=None。v2 起 sig 兼作版面显示的位置串，
+    故 `:None` 防护移至 sig_of 构造源（原 render._location 渲染侧兜底随 v1 移除）。line=None
+    时 sig 省略行段（rule_id:file），既不渗 `:None` 进显示、又让 ack 锚点洁净可用。"""
+    from touchstone import render
     f = {"rule_id": "PRA-Y", "file": "a.py", "line": None, "rationale": "问题",
-         "fix_direction": "", "fix_reasoning": "",
+         "fix_direction": "方向", "fix_reasoning": "",
          "done_criteria": {"kind": "review", "spec": {"question": "?"}},
          "severity": "warn", "confidence": 0.7, "agent": "pr-agent:review"}
-    entry = _finding_entry(1, f)
-    assert "a.py:None" not in entry
-    assert "`a.py`" in entry                        # 行号缺失→只显示文件名
+    body = render.render_findings_checklist([f], cl.from_findings([f]))
+    assert "a.py:None" not in body
+    assert "PRA-Y:a.py" in body                    # 行号缺失→sig 省略行段，仍可作 ack 锚点
 
 
 def test_normalize_line_falls_back_to_line_end():
@@ -345,7 +374,7 @@ def test_normalize_line_prefers_start_when_both_present():
 
 
 def test_normalize_line_zero_start_not_treated_as_missing():
-    """line_start=0 不被当缺失（`is not None` 而非 `or`，与 render._location 一致）。
+    """line_start=0 不被当缺失（`is not None` 而非 `or`，与 checklist.sig_of 一致）。
 
     GitHub diff 行号 1-based，0 罕见；但 0 是 falsy，若用 `or` 会被误判缺失→错误回退
     line_end。用 `is not None` 判定，0 作为真实行号保留。"""
@@ -393,13 +422,21 @@ def test_checklist_unacked_but_fixed_resolves_and_new_findings_append():
 
 
 def test_checklist_ack_parse_and_render_marker_roundtrip():
+    from touchstone import render
     body = "改好了\n```touchstone-ack\nR-1:a.py:1: done\nR-2:a.py:2: waived: 测试夹具\n```"
     acks = cl.parse_acks([body])
     assert acks["R-1:a.py:1"]["verb"] == "done"
     assert acks["R-2:a.py:2"] == {"verb": "waived", "note": "测试夹具"}
     c = cl.from_findings([_finding("R-1")])
-    md = cl.render(c, rounds_left=2)
-    assert "- [ ]" in md and "达成判据" in md and "剩余轮次 2" in md
+    # v2：可见渲染（task list + 达成判据）在 render_findings_checklist，轮次在 render_status_line，
+    # marker 在 render_marker。三处分离，各司其职。
+    fc = render.render_findings_checklist([_finding("R-1")], c)
+    assert "- [ ]" in fc and "达成判据" in fc
+    st = render.render_status_line({"risk_band": "low", "human_action": "skip",
+                                    "verification_decision": "cheap_only", "blast_radius": []},
+                                   loop_info=("continue", "", ""), checklist=c, rounds_left=2)
+    assert "剩余 2 轮" in st
+    md = cl.render_marker(c)
     assert cl.parse_latest([md]) == c                     # marker 往返无损
 
 
@@ -415,7 +452,7 @@ def test_checklist_marker_survives_arrow_in_item_content():
          "done_criteria": {"kind": "review", "spec": {"question": "替换了吗？"}},
          "status": "waived", "note": "author 宣称可豁免：<!-- x --> 是文档不是代码"}],
         "resolved_rate": 1.0}
-    md = cl.render(c)
+    md = cl.render_marker(c)
     assert cl.parse_latest([md]) == c                     # 含 --> 仍往返无损
 
 
@@ -489,7 +526,7 @@ def test_detect_lineage_normalizes_inherited_dirty_sig():
                                         "done_criteria": {"kind": "review", "spec": {"question": "q"}},
                                         "note": ""}]}
     bot_comment = {"user": {"login": "github-actions[bot]"},
-                   "body": loop.render_marker(loop.LoopState(2, [], None)) + "\n" + cl.render(dirty_cl)}
+                   "body": loop.render_marker(loop.LoopState(2, [], None)) + "\n" + cl.render_marker(dirty_cl)}
     api = _fake_api(closed_prs=[{"number": 41, "merged_at": None, "closed_at": "2026-07-01T00:00:00Z"}],
                     files_by_pr={41: [{"filename": "a.py", "additions": 10, "deletions": 0}]},
                     comments_by_pr={41: [bot_comment]})
@@ -639,7 +676,7 @@ def test_detect_lineage_inherits_rounds_and_open_items():
     old_cl = cl.from_findings([_finding("R-1")])
     bot_comment = {"user": {"login": "github-actions[bot]"},
                    "body": loop.render_marker(loop.LoopState(2, [], None)) + "\n"
-                           + cl.render(old_cl)}
+                           + cl.render_marker(old_cl)}
     api = _fake_api(
         closed_prs=[{"number": 41, "merged_at": None, "closed_at": "2026-07-01T00:00:00Z"}],
         files_by_pr={41: [{"filename": "a.py", "additions": 10, "deletions": 0}]},
@@ -695,14 +732,13 @@ def test_render_report_seven_sections_and_no_template_comment_leak():
     diff = build_diff([("auth/x.py", ["k = 1"], True)])
     sf = cc.scope_facts(diff)
     md = orchestrator.render_report(
-        risk, [f], banner="**反馈循环：🔁 继续** — 第 1 轮",
-        scope_facts=sf, checklist_md=cl.render(cl.from_findings([f])),
+        risk, [f], scope_facts=sf, checklist=cl.from_findings([f]),
+        loop_info=("continue", "待 author 逐项申报", ""),
         markers="<!-- touchstone-loop: {} -->")
-    for token in ("AI Committer 代码检视", "静态检查", "敏感路径命中", "方向：", "达成判据",
-                  "待解决问题清单", "touchstone-loop"):
+    for token in ("AI Committer 代码检视", "敏感路径命中", "达成判据",
+                  "评审发现与销项", "touchstone-loop"):
         assert token in md
     assert "版面模板" not in md                    # 模板头注释不外泄进评论
-    assert "改这里" not in md or True
     assert "suggested_fix" not in md
 
 
@@ -834,9 +870,10 @@ def test_loop_reliable_converges_normally(rule_index):
     assert dec == "converged"
 
 
-# ---------------- 易读性改版：排版铁律回归（2026-07-04）----------------
+# ---------------- 易读性改版：排版铁律回归（2026-07-04；v2 2026-08 六段重设计）----------------
 def test_report_layout_invariants():
-    """铁律：全文唯一 H2；③④⑤⑥ 并列段一律 H3；横幅 blockquote；日志行无实现细节括注。"""
+    """铁律（v2）：全文唯一 H2；③④⑤ 并列段一律 H3；状态行 blockquote（循环+风险合一）。
+    v2 版面：七段→六段——AI 评审 + 清单合为「评审发现与销项」；验证/日志 + 申报指引折进「参考信息」。"""
     from touchstone import render, checklist as cl
     risk = {"risk_band": "mid", "human_action": "a", "verification_decision": "v",
             "blast_radius": ["x"]}
@@ -845,22 +882,21 @@ def test_report_layout_invariants():
          "done_criteria": {"kind": "deterministic", "spec": {"recheck": "R1"}}}
     sf = {"parse_ok": True, "totals": {"files": 1, "added": 1, "deleted": 0}, "sensitive_hits": []}
     body = render.render_report(
-        risk, [f], banner="**反馈循环：🔁 继续** — x", scope_facts=sf,
-        checklist_md=cl.render(cl.from_findings([f])),
-        verification_md="### 验证与日志\n\n📄 完整 LLM 交互日志：http://x",
+        risk, [f], scope_facts=sf, checklist=cl.from_findings([f]),
+        loop_info=("continue", "待 author 逐项申报", ""),
+        verification_blocks=["📄 完整 LLM 交互日志：http://x"],
         markers="<!-- m -->", gate_line="1/1")
     lines = body.split("\n")
     h2 = [l for l in lines if l.startswith("## ")]
-    h3 = [l for l in lines if l.startswith("### ")]
+    h3 = [l for l in lines if l.startswith("### ") and not l.startswith("#### ")]
     assert len(h2) == 1 and "Touchstone · AI Committer 代码检视" in h2[0]  # 唯一 H2 承载品牌与定位
-    # 易读性改版·二：发现区新增 #### 分组子标题（规则检查/AI建议），h3 仍是四段，不含 ####
-    h3 = [l for l in h3 if not l.startswith("#### ")]
-    assert {l.split("（")[0] for l in h3} == {"### 静态检查", "### AI 评审",
-                                              "### 待解决问题清单", "### 验证与日志"}  # 并列段同级
-    assert any(l.startswith("> ") for l in lines)                   # 横幅 blockquote
-    assert "完整 LLM 交互日志：" in body and "原始输出" not in body   # 日志行无括注
-    assert "<details><summary>如何申报销项</summary>" in body        # 样板折叠
-    assert "> **风险等级：" in body and "> **触发因子：**" in body   # 态势区改陈述行（非四列表）
+    # v2 六段：静态检查（③）+ 评审发现与销项（④）+ 参考信息（⑤）三段 H3 并列
+    assert {l.split("（")[0] for l in h3} == {"### 静态检查", "### 评审发现与销项",
+                                              "### 参考信息"}  # 并列段同级
+    assert any(l.startswith("> ") for l in lines)                   # 状态行 blockquote
+    assert "完整 LLM 交互日志：" in body
+    assert "<details><summary>如何申报销项</summary>" in body        # 申报指引折叠（参考信息段）
+    assert "风险等级：" in body and "触发因子" in body               # 状态行含风险+触发因子
     assert "| 风险等级 | 建议动作 | 验证建议 | 影响面 |" not in body    # 旧四列枚举表已移除
 
 
@@ -869,7 +905,7 @@ def test_render_report_does_not_rescan_substituted_placeholders():
     文本含 `{{markers}}` 占位符（LLM 输出 / 对抗构造 / legitimately 讨论模板），【最后一步】的 markers
     替换会扫描整段 out、把 markers 段内容注入 finding 文本（占位符注入 / 串段）。修：单遍 re.sub 替换，
     替换文本不被重扫，占位符在内容值里保持字面。"""
-    from touchstone import render
+    from touchstone import render, checklist as cl
     risk = {"risk_band": "low", "human_action": "skip",
             "verification_decision": "cheap_only", "blast_radius": []}
     f = {"rule_id": "R1", "severity": "warn", "confidence": 0.9, "agent": "pr-agent",
@@ -877,7 +913,8 @@ def test_render_report_does_not_rescan_substituted_placeholders():
          "rationale": "详见 {{markers}} 段",              # 故意带占位符——修复前会被展开
          "fix_direction": "d",
          "done_criteria": {"kind": "deterministic", "spec": {"recheck": "R1"}}}
-    body = render.render_report(risk, [f], markers="<!-- ZZZ_SECRET_MARKER -->")
+    body = render.render_report(risk, [f], checklist=cl.from_findings([f]),
+                                markers="<!-- ZZZ_SECRET_MARKER -->")
     # 修复前（顺序 replace）：finding 里的 {{markers}} 被最后一步 markers 替换展开成 markers 内容
     #   → "{{markers}}" 不在 body、ZZZ_SECRET_MARKER 注入 finding 文本
     # 修复后（单遍）：finding 里的 {{markers}} 保持字面、不被重扫展开
@@ -886,19 +923,18 @@ def test_render_report_does_not_rescan_substituted_placeholders():
 
 # ---------------- 不可信评审的呈现层接入（PR #44 教训回归）----------------
 def test_unreliable_review_renders_caution_and_distrusts_action():
-    """铁律：review_reliable=False 必须 [!CAUTION] 置顶告警；态势表不采信 skip 类建议；
+    """铁律：review_reliable=False 必须 [!CAUTION] 告警；状态行风险标注 LLM 不可信、不采信 skip 类建议；
     机器 marker 数据不受展示覆盖影响（由调用方原样写入，此处只验展示层不改 risk dict）。"""
     from touchstone import render
     risk = {"risk_band": "low", "human_action": "skip",
             "verification_decision": "cheap_only", "blast_radius": []}
     sf = {"parse_ok": True, "totals": {"files": 9, "added": 171, "deleted": 13},
           "sensitive_hits": []}
-    body = render.render_report(risk, [], banner="**反馈循环：🔁 继续** — x",
-                                scope_facts=sf, review_reliable=False,
+    body = render.render_report(risk, [], scope_facts=sf, review_reliable=False,
                                 engine_status="llm_failed", ai_raw_count=0, added_lines=171)
-    assert body.splitlines()[2] == "> [!CAUTION]"            # 置顶（H2 与空行之后第一块）
+    assert "[!CAUTION]" in body                               # CAUTION 告警出现
     assert "本轮 AI 评审不可信" in body
-    assert "需人工评审" in body and "原 AI 建议不采信" in body   # 不可信时改示待人工
+    assert "需人工评审" in body                                 # 不可信时改示待人工
     assert "无需人工介入" not in body                            # skip→"无需人工介入"不该出现（误导）
     assert risk["human_action"] == "skip"                     # 只改展示，不改机器数据
 
@@ -919,28 +955,29 @@ def test_reliable_review_keeps_normal_layout():
     assert "[!CAUTION]" not in body and "无需人工介入" in body   # skip 译为"无需人工介入"
 
 
-# ---------------- pr-agent 评审意见：不可信时保留非降级 banner 内容 ----------------
+# ---------------- pr-agent 评审意见：不可信时保留非降级告警内容 ----------------
 def test_render_unreliable_preserves_non_degradation_banner():
-    # 不可信时 det_warning/unverified_claims/循环状态不应被 CAUTION 告警整块覆盖丢弃
+    # 不可信时 det_warning/unverified_claims 不应被 CAUTION 告警整块覆盖丢弃；
+    # 循环状态归状态行（①），告警归告警段（②）——v2 分离。
     risk = {"risk_band": "high", "human_action": "read+arbitrate",
             "verification_decision": "full_suite", "blast_radius": ["security_surface"]}
-    banner = ("**反馈循环：🔁 继续** - 第 1 轮\n\n"
-              "⚠️ **契约解析告警**\n\n"
+    alerts = ("⚠️ **契约解析告警**\n\n"
               "🟡 **2 条 waived/split 系 author 自证、机器未验证**")
     md = orchestrator.render_report(
-        risk, [], banner=banner, review_reliable=False,
+        risk, [], alerts=alerts, review_reliable=False,
+        loop_info=("continue", "待 author 逐项申报", ""),
         engine_status="llm_failed", ai_raw_count=0, added_lines=50)
-    assert "[!CAUTION]" in md                       # CAUTION 告警置顶
+    assert "[!CAUTION]" in md                       # CAUTION 告警出现
     assert "契约解析告警" in md                      # det_warning 保留
     assert "author 自证" in md                       # unverified_claims 保留
-    assert "反馈循环：🔁 继续" in md                 # 循环状态保留
+    assert "🔁 继续" in md                           # 循环状态在状态行
 
 
 def test_render_unreliable_no_banner_still_has_caution():
-    # 无 banner 时不可信仍输出 CAUTION，不崩
+    # 无告警时不可信仍输出 CAUTION，不崩
     risk = {"risk_band": "low", "human_action": "skip",
             "verification_decision": "cheap_only", "blast_radius": []}
-    md = orchestrator.render_report(risk, [], banner="", review_reliable=False,
+    md = orchestrator.render_report(risk, [], review_reliable=False,
                                     engine_status="llm_failed", ai_raw_count=0, added_lines=50)
     assert "[!CAUTION]" in md
 
@@ -968,53 +1005,108 @@ def test_loop_reliable_no_progress_still_escalates(rule_index):
     assert dec == "escalate"
 
 
-# ---------------- 易读性改版·二：态势区陈述行 + 发现分组 + 清单方向标题（2026-07-10）----------------
+# ---------------- v2：状态行（循环+风险合一）的陈述行 + 触发因子纪律 ----------------
 def test_situation_block_is_prose_not_table():
-    """态势区改「标签+人话」陈述行；枚举译中文；verification_decision 移出（机器信号）。"""
+    """v2 状态行：标签+人话陈述（非表格）；枚举译中文；verification_decision 不入状态行（机器信号）。"""
     from touchstone import render
     risk = {"risk_band": "high", "human_action": "read+arbitrate",
             "verification_decision": "targeted_tests",
             "blast_radius": ["cross_module_contract", "security_surface"]}
-    head, _ = render.render_findings(risk, [])
-    assert "风险等级：高" in head and "需人工评审后合入" in head
-    assert "触发因子：" in head and "跨模块契约变更" in head and "涉及安全面" in head
-    assert "|" not in head                                  # 不再是表格
-    assert "targeted_tests" not in head                     # 验证档不在态势区（移至验证与日志）
-    assert "read+arbitrate" not in head                     # 枚举名不外露
+    st = render.render_status_line(risk)
+    assert "风险等级：高" in st and "需人工评审后合入" in st
+    assert "触发因子：" in st and "跨模块契约变更" in st and "涉及安全面" in st
+    assert "|" not in st                                     # 不再是表格
+    assert "targeted_tests" not in st                        # 验证档不入状态行（移至参考信息）
+    assert "read+arbitrate" not in st                        # 枚举名不外露
 
 
 def test_situation_block_omits_trigger_line_when_no_factors():
-    """去冗余：无触发因子（blast_radius 空）时态势区不显「触发因子：无」。有因子时照常显。"""
+    """去冗余：无触发因子（blast_radius 空）时状态行不显「触发因子：无」。有因子时照常显。"""
     from touchstone import render
     risk_none = {"risk_band": "low", "human_action": "skip",
                  "verification_decision": "cheap_only", "blast_radius": []}
-    head, _ = render.render_findings(risk_none, [])
-    assert "触发因子" not in head                     # 无因子 → 省行（不再显「触发因子：无」）
-    assert "风险等级：低" in head
+    st = render.render_status_line(risk_none)
+    assert "触发因子" not in st                       # 无因子 → 省行（不再显「触发因子：无」）
+    assert "风险等级：低" in st
     # 对照：有因子 → 照常显
-    head2, _ = render.render_findings(dict(risk_none, blast_radius=["security_surface"]), [])
-    assert "触发因子" in head2 and "涉及安全面" in head2
+    st2 = render.render_status_line(dict(risk_none, blast_radius=["security_surface"]))
+    assert "触发因子" in st2 and "涉及安全面" in st2
+
+
+def test_facts_omit_sensitive_path_line_when_no_hit():
+    """v2（观测意见 7）：修改范围删除（与 PR UI 统计重复）；无敏感路径命中时整行省略（不再写
+    「敏感路径命中：无」）。简单 PR（无命中 + 无门禁）→ 整段静态检查省略（零噪声）。"""
+    from touchstone import render
+    sf_no_hit = {"parse_ok": True,
+                 "totals": {"files": 1, "added": 2, "deleted": 0},
+                 "sensitive_hits": []}
+    facts = render.render_facts_v2(sf_no_hit)
+    assert facts == ""                                   # 无敏感路径 + 无门禁 → 整段省略
+    assert "修改范围" not in facts                       # 修改范围删除（与 PR UI 重复）
+    assert "敏感路径命中：无" not in facts                # 旧措辞彻底消失
+    # 对照：有命中 → 照常显（含规则名），仍无修改范围
+    sf_hit = {"parse_ok": True, "totals": {"files": 1, "added": 1, "deleted": 0},
+              "sensitive_hits": [{"rule": "SEC-PATH", "path": "auth/k.py"}]}
+    facts_hit = render.render_facts_v2(sf_hit)
+    assert "敏感路径命中（SEC-PATH）：`auth/k.py`" in facts_hit
+    assert "修改范围" not in facts_hit                   # v2：修改范围在所有情形下都不显
+
+
+def test_status_line_merges_loop_and_risk_into_one_line():
+    """v2（观测意见 6）：循环决策 + 风险等级合成状态行同一 blockquote 行——替代旧版两行。
+    断言：同一 `>` 行内同时含循环 emoji 与风险等级。"""
+    from touchstone import render
+    risk = {"risk_band": "mid", "human_action": "read",
+            "verification_decision": "cheap_only", "blast_radius": []}
+    body = render.render_report(risk, [], loop_info=("continue", "待 author 逐项申报", ""))
+    lines = body.split("\n")
+    status = [l for l in lines if l.startswith("> ") and "风险等级" in l]
+    assert len(status) == 1                                # 唯一状态行
+    assert "🔁 继续" in status[0] and "风险等级：中" in status[0]   # 循环+风险在同一行
+
+
+def test_caution_stands_apart_from_status_line_when_unreliable():
+    """v2 边界：不可信时 [!CAUTION] 在告警段（②），状态行（①，含循环+风险）在其前——
+    CAUTION 不吞掉状态行（避免过度渲染），两段各自独立 blockquote。"""
+    from touchstone import render
+    risk = {"risk_band": "low", "human_action": "skip",
+            "verification_decision": "cheap_only", "blast_radius": []}
+    md = render.render_report(
+        risk, [], review_reliable=False,
+        loop_info=("continue", "待 author 逐项申报", ""),
+        engine_status="llm_failed", ai_raw_count=0, added_lines=50)
+    lines = md.split("\n")
+    caution_idx = next(i for i, ln in enumerate(lines) if ln.strip() == "> [!CAUTION]")
+    status_idx = next(i for i, ln in enumerate(lines) if "风险等级" in ln and ln.startswith("> "))
+    assert status_idx < caution_idx                       # 状态行（①）在 CAUTION（②）前
+    # CAUTION 块（连续 > 行）里不含风险等级——状态行已承载，不重复
+    caution_lines = []
+    for ln in lines[caution_idx:]:
+        if not ln.startswith(">"):
+            break
+        caution_lines.append(ln)
+    assert "风险等级" not in "\n".join(caution_lines)
 
 
 def test_checklist_render_hides_ack_help_when_empty():
     """去冗余：空清单（0 发现即收敛，如 PR #70）无项可申报——「如何申报销项」折叠省去。
-    marker 仍在（机读状态不丢）；有项时照常显申报指引。"""
-    from touchstone import checklist as cl
-    body_empty = cl.render({"round": 1, "items": [], "resolved_rate": 1.0})
-    assert "如何申报销项" not in body_empty           # 空清单 → 省折叠
-    assert "touchstone-checklist" in body_empty       # marker 仍在（机读状态不丢）
-    # 对照：有项 → 照常显申报指引
-    f = {"rule_id": "R1", "severity": "warn", "confidence": 0.9, "agent": "pr-agent",
-         "file": "a.py", "line": 1, "rationale": "r", "fix_direction": "d",
-         "done_criteria": {"kind": "deterministic", "spec": {"recheck": "R1"}}}
-    assert "如何申报销项" in cl.render(cl.from_findings([f]))
-
-
-def test_findings_grouped_by_rule_vs_ai():
-    """发现按来源两层拆分：确定性规则命中归「静态检查」，LLM 发现归「AI 评审」。"""
+    v2：申报指引由 render_reference 据 has_checklist_items 开关决定显隐。marker 永远在。"""
     from touchstone import render
-    risk = {"risk_band": "high", "human_action": "read", "verification_decision": "cheap_only",
-            "blast_radius": []}
+    # 空清单 → 无申报指引
+    ref_empty = render.render_reference(has_checklist_items=False)
+    assert "如何申报销项" not in ref_empty             # 空清单 → 省折叠
+    # 对照：有项 → 照常显申报指引
+    ref_has = render.render_reference(has_checklist_items=True)
+    assert "如何申报销项" in ref_has
+    # marker 永远在（机读状态不丢）
+    assert "touchstone-checklist" in cl.render_marker({"round": 1, "items": [], "resolved_rate": 1.0})
+
+
+def test_findings_checklist_merges_rule_and_ai_sources():
+    """v2（观测意见 4）：确定性规则命中 + LLM 建议合为一段「评审发现与销项」——不再按来源
+    拆成「静态检查·规则命中」+「AI 评审」两段。两类发现都在同一 - [ ] task list，由 agent
+    元数据小字区分来源。"""
+    from touchstone import render, checklist as cl
     findings = [
         {"rule_id": "DANGER-001", "severity": "error", "confidence": 1.0, "agent": "contract",
          "file": "a.py", "line": 1, "rationale": "r", "fix_direction": "d",
@@ -1023,22 +1115,18 @@ def test_findings_grouped_by_rule_vs_ai():
          "file": "b.py", "line": 2, "rationale": "r", "fix_direction": "d",
          "done_criteria": {"kind": "review", "spec": {"question": "q？"}}},
     ]
-    _, body = render.render_findings(risk, findings)
-    # AI 评审段只含 LLM（pr-agent）发现
-    assert "### AI 评审" in body
-    assert "b.py:2" in body and "需人工复核：q？" in body      # pr-agent 那条在此
-    assert "a.py:1" not in body                                # 规则命中(非 pr-agent)不入 AI 评审
-    # 确定性规则命中归「静态检查」段
-    rule_only = [f for f in findings if not str(f.get("agent", "")).startswith("pr-agent")]
-    facts = render.render_facts({"parse_ok": True, "totals": {}, "sensitive_hits": []},
-                                rule_findings=rule_only)
-    assert "#### 规则命中（可复现）" in facts
-    assert "a.py:1" in facts                                   # DANGER-001 那条在此
+    c = cl.from_findings(findings)
+    md = render.render_findings_checklist(findings, c)
+    assert "### 评审发现与销项" in md                      # 合为一段（不再分「静态检查·规则命中」+「AI 评审」）
+    assert "a.py:1" in md and "b.py:2" in md              # 两类发现同段
+    assert "需人工复核：q？" in md                         # LLM 发现的达成判据
+    assert "`DANGER-001`" in md and "`PRA-X`" in md       # agent 元数据小字区分来源
 
 
-def test_checklist_direction_as_title_and_status_unified():
-    """收敛清单：方向当标题、位置次要、sig 降锚点；状态措辞统一；销项率不溢出。"""
-    from touchstone import checklist as cl
+def test_findings_checklist_merges_direction_status_and_sig():
+    """v2（观测意见 2+3+4）：方向当标题、sig 兼位置+锚点（不再单列位置/锚点行）；状态措辞统一；
+    无「销项跟踪：…见上方」样板（详情已在同段）。"""
+    from touchstone import render
     c = {"round": 3, "resolved_rate": 0.33, "items": [
         {"sig": "R@a.py:1", "status": "open", "direction": "收紧正则", "reasoning": "",
          "done_criteria": {"kind": "deterministic", "spec": {"recheck": "R"}}, "note": ""},
@@ -1046,20 +1134,53 @@ def test_checklist_direction_as_title_and_status_unified():
          "done_criteria": {"kind": "review", "spec": {"question": "q？"}}, "note": "复核通过"},
         {"sig": "R@c.py:3", "status": "waived", "direction": "后补", "reasoning": "",
          "done_criteria": {}, "note": "下个 PR"}]}
-    md = cl.render(c, rounds_left=6)
-    assert "销项率 33%" in md                                # 0.33→33%（非 3300%）
-    assert "**收紧正则**" in md and "位置：`a.py:1`" in md    # 方向标题 + 位置次要
-    assert "⬜ 待处理" in md and "✅ 已复核销项" in md
+    md = render.render_findings_checklist([], c)
+    assert "**收紧正则**" in md                             # 方向当标题
+    assert "`R@a.py:1`" in md                              # sig 在 checkbox 标题行（兼位置+锚点）
+    assert "⬜ 待处理" in md and "✅ 已复核销项" in md       # 状态措辞统一
     assert "🟡 待人核准（author 豁免）" in md
-    assert "状态说明：" not in md                            # 去前缀
-    assert "锚点 `R@a.py:1`" in md                           # sig 降锚点小字
+    assert "销项跟踪：" not in md                          # 样板删除（观测意见 3）
+    assert "位置：`" not in md                             # 不再单列位置行（sig 已兼）
+    assert "锚点 `" not in md                              # 不再单列锚点行
 
 
-def test_checklist_resolved_rate_never_exceeds_100():
-    """销项率兜底：异常大值也不溢出（护栏）。"""
-    from touchstone import checklist as cl
-    md = cl.render({"round": 1, "resolved_rate": 33, "items": []})   # 误传 33 而非 0.33
-    assert "销项率 100%" in md                               # min(100,...) 兜底
+def test_findings_checklist_resolved_item_without_direction_not_pending():
+    """已销项项无方向时不显「（待补修复方向）」（PRA-REVIEW round-3 data-loss）。
+    「待补」暗示待办，但已销项（done/waived/split）无需再补——方向是历史快照、本就可能未留存。
+    open 项无方向仍显「待补」（提示 author 补）；已销项项改显「（已销项）」。"""
+    from touchstone import render
+    c = {"round": 2, "resolved_rate": 0.5, "items": [
+        {"sig": "R@a.py:1", "status": "open", "direction": "", "reasoning": "",
+         "done_criteria": {}, "note": ""},
+        {"sig": "R@b.py:2", "status": "done", "direction": "", "reasoning": "",
+         "done_criteria": {}, "note": "复核通过"}]}
+    md = render.render_findings_checklist([], c)
+    # open 项无方向 → 待补（提示补方向）
+    assert "（待补修复方向）" in md
+    # 已销项项无方向 → 不显「待补」（改显「已销项」，不误导）
+    assert md.count("（待补修复方向）") == 1                  # 只有 open 项那一处
+    assert "（已销项）" in md                                 # done 项用此占位
+
+
+def test_status_line_resolved_rate_never_exceeds_100():
+    """销项率兜底：异常大值也不溢出（护栏）。v2：销项率在状态行（render_status_line）。
+    用非空 items 驱动（空清单不显示销项率——见 test_status_line_omits_rate_for_empty_checklist）。"""
+    from touchstone import render
+    st = render.render_status_line(
+        {"risk_band": "low", "human_action": "skip", "verification_decision": "cheap_only", "blast_radius": []},
+        checklist={"round": 1, "resolved_rate": 33, "items": [{"sig": "R:0", "status": "open"}]})  # 误传 33
+    assert "销项率 100%" in st                              # min(100,...) 兜底
+
+
+def test_status_line_omits_rate_for_empty_checklist():
+    """空清单（items=[]）不显示销项率——_rate([])=1.0，若显示则「销项率 100%」对零项清单
+    是噪声，与 v2 去冗余目标矛盾（PRA-GENERAL round-1）。真值守卫（非 `is not None`）：空列表
+    是 falsy，跳过销项率行。"""
+    from touchstone import render
+    st = render.render_status_line(
+        {"risk_band": "low", "human_action": "skip", "blast_radius": []},
+        checklist={"round": 1, "resolved_rate": 1.0, "items": []})   # 空清单（_rate 空列表=1.0）
+    assert "销项率" not in st
 
 
 # ---------------- 变异体回归锁：waived 收敛门的轮次耗尽边界 ----------------

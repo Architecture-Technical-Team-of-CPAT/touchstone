@@ -24,8 +24,74 @@ permissions:
   # import 兜底检查保证不崩、日志可观测是否命中。
 
 jobs:
+  # ---- 前置：gitleaks 密钥/敏感信息扫描（SEC-001 确定性门禁的高召回补位）----
+  # 产出 check-run "gitleaks"（手动建，名字精确匹配 checks.yaml relay 的 source_check）。
+  # 方案 3（同工作流 needs）：touchstone 等其完成 → relay 读结论折进总闸，消跨工作流时序的"未完成"假 failure。
+  # 安全：gitleaks 只读扫描（不执行 PR 代码），pull_request_target 下 checkout PR head 无注入面。
+  # 为何不用 gitleaks-action@v2：它不支持 pull_request_target 事件（"The event is not yet supported"
+  # 硬限制），在本工作流触发器下恒 error → relay fail-closed → 总闸恒失败、阻塞所有 PR。
+  # 改直接跑 gitleaks CLI + 手动建 check-run（pull_request_target 下可用，保留同工作流 needs: 时序保证）。
+  gitleaks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write          # 手动建 gitleaks check-run（relay 按名读结论折进总闸）
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}   # 扫 PR 代码（非 base）
+          fetch-depth: 0       # 完整历史——commit-range 扫描需 base..head 的提交都在
+          persist-credentials: false
+      - name: 安装 gitleaks
+        run: |
+          VERSION=8.30.1
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: gitleaks 扫描
+        id: scan
+        continue-on-error: true    # gitleaks 退出 1=发现泄露——要让 job 继续到建 check-run 步
+        run: |
+          # 扫 PR 提交范围（base..head）——只拦本 PR 引入的泄露，不翻历史旧账
+          gitleaks detect --source . \
+            --config .gitleaks.toml \
+            --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" \
+            --redact --report-format json --report-path /tmp/gitleaks.json
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+      - name: 发布 gitleaks check-run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const code = Number('${{ steps.scan.outputs.code }}');
+            // 0=干净(success), 1=发现泄露(failure), 其他=工具错误(neutral)
+            const conclusion = code === 0 ? 'success' : code === 1 ? 'failure' : 'neutral';
+            const fs = require('fs');
+            let leakCount = 0;
+            try {
+              leakCount = JSON.parse(fs.readFileSync('/tmp/gitleaks.json', 'utf8')).length;
+            } catch {}                                  // 干净时 gitleaks 不生成 report 文件
+            const summary = conclusion === 'success'
+              ? '✅ 未发现泄露'
+              : conclusion === 'failure'
+                ? `❌ 发现 ${leakCount} 处疑似泄露（零路径排除——所有文件都扫）`
+                : `⚠️ gitleaks 工具错误（exit ${code}）`;
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'gitleaks',
+              head_sha: context.payload.pull_request.head.sha,
+              status: 'completed',
+              conclusion,
+              output: { title: `gitleaks · ${conclusion}`, summary }
+            });
+
   # ---- 判断层：评审（advisory，不拦截；不在此发总闸，交给 gate job）----
+  # needs gitleaks + !cancelled()：gitleaks 完成（无论成败）后才跑——relay 读 gitleaks check-run
+  # 折进总闸。gitleaks 失败（发现泄露）时 touchstone 仍跑（!cancelled 不被上游失败挡），relay 读到
+  # failure → 总闸 failure，统一出口。gitleaks 不会跳过（无 if），故无 skipped 态需兜。
   touchstone:
+    needs: [gitleaks]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest          # 自托管 runner 见下方网络注记
     outputs:
       decision: ${{ steps.run.outputs.verification_decision }}

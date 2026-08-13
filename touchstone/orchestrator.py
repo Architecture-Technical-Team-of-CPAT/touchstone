@@ -33,10 +33,13 @@ from touchstone import checklist as checklist_mod   # 收敛清单（修订设�
 from touchstone import lineage               # 轮次台账与同源检测（修订设计 §4.4，评审意见 10）
 from touchstone.atomicio import atomic_write_json   # 状态文件原子写（决策输入不留半文件）
 from touchstone.artifacts import artifact_path      # 统一产物路径（默认 CWD，可经 OUTPUT_DIR 隔离）
-# 渲染层已拆至 touchstone/render.py（七段版面填充；模块职责单一化）。此处再导出以保持
+# 渲染层已拆至 touchstone/render.py（v2 六段版面填充；模块职责单一化）。此处再导出以保持
 # 既有引用路径 orchestrator.render_* 兼容（测试与外部调用无需改动）。
-from touchstone.render import (_load_template, render_facts, render_findings,  # noqa: F401
-                               render_report, render_summary)               # 轮次台账与同源检测（修订设计 §4.4，评审意见 10）
+# v2：render_facts/render_findings（v1 七段版面的两段渲染函数）已随版面合并移除——态势区→
+# render_status_line、AI 评审+清单→render_findings_checklist、静态检查→render_facts_v2。
+# 再导出仅保留仍存在的 render_report / render_summary。
+from touchstone.render import (_load_template,  # noqa: F401
+                               render_report, render_summary)
 
 # --- 配置 ---------------------------------------------------------------------
 STANDARDS_PATH = os.environ.get("TOUCHSTONE_STANDARDS", ".touchstone/standards.yaml")
@@ -214,29 +217,31 @@ def post_results(owner, repo, number, head_sha, token, risk, findings, loop_info
                  change_class=None, diff=None, injected_types=None, injected_experience_ids=None,
                  shadow_types=None, shadow_experience_ids=None,
                  engine_status="ok", det_warning="", ai_raw_count=0, added_lines=0, n_changed=0,
-                 scope_facts=None, checklist_md="", ledger=None, review_reliable=True,
+                 scope_facts=None, checklist=None, rounds_left=None, ledger=None,
+                 review_reliable=True,
                  llm_notes=None, raw_excerpt=None, unverified_claims=0, telemetry_status="disabled",
                  engine_detail=""):
-    # (1) 摘要评论——总是成功；按七段版面模板组装（修订设计 §3 意见 4）：
-    #     ①横幅 ②态势表 ③静态检查区 ④AI 评审 ⑤待解决问题清单 ⑥验证与日志 ⑦机器 marker
+    # (1) 摘要评论——总是成功；按 v2 六段版面模板组装：
+    #     ①标题+状态行 ②告警 ③静态检查 ④评审发现与销项 ⑤参考信息 ⑥机器 marker
     # 评审不可信时，降级说明/0-发现溯源统一并入 render 层的 [!CAUTION] 置顶告警
     # （见 render.render_unreliable_callout；判定层的 review_reliable 信号在此接到呈现层）；
-    # 可信时保持原横幅逻辑。det_warning（确定性侧警告）与可信度无关，两种情形都保留。
-    banner = "" if not review_reliable else _engine_banner(engine_status)
+    # 可信时保持原逻辑。det_warning（确定性侧警告）与可信度无关，两种情形都保留。
+    # v2：循环状态行不再并入 alerts——归 render_status_line（① 状态行），alerts 只载告警。
+    alerts = "" if not review_reliable else _engine_banner(engine_status)
     if det_warning:
-        banner = (banner + "\n\n" if banner else "") + f"⚠️ **{det_warning}**"
-    if review_reliable and not banner and not findings:
+        alerts = (alerts + "\n\n" if alerts else "") + f"⚠️ **{det_warning}**"
+    if review_reliable and not alerts and not findings:
         # 引擎正常且可信的 0 发现：附溯源，让人区分"LLM 真审了没问题"与"没真审"
-        banner = _clean_review_trace(engine_status, ai_raw_count, added_lines, n_changed,
+        alerts = _clean_review_trace(engine_status, ai_raw_count, added_lines, n_changed,
                                      raw_excerpt=raw_excerpt)
     for note in (llm_notes or []):
-        banner = (banner + "\n\n" if banner else "") + note
+        alerts = (alerts + "\n\n" if alerts else "") + note
     if unverified_claims:
         # author 自证销项点名——advisory 下提示人核准，autonomy 下已独立拦（no_unverified_claims 闸）
-        banner = (banner + "\n\n" if banner else "") + (
+        alerts = (alerts + "\n\n" if alerts else "") + (
             f"🟡 **{unverified_claims} 条 waived/split 系 author 自证、机器未验证**："
             "这些豁免/拆分需人核准，不计入机器可验证收敛，也不触发自动放行。")
-    # 遥测上报状态进横幅（防静默故障：可观测性子系统自身状态对运维可见，不只进 stderr）。
+    # 遥测上报状态进告警（防静默故障：可观测性子系统自身状态对运维可见，不只进 stderr）。
     # 仅在启用遥测时显示——默认关（disabled）时不加行，免噪声。failed 时附原因，让人能定位。
     if telemetry_status and telemetry_status != "disabled":
         if telemetry_status == "ok":
@@ -245,21 +250,29 @@ def post_results(owner, repo, number, head_sha, token, risk, findings, loop_info
             _reason = (telemetry_status[len("failed:"):].strip()
                        if telemetry_status.startswith("failed:") else telemetry_status)
             _tel_line = f"📡 **遥测**：上报失败（不阻塞评审）— {_reason}"
-        banner = (banner + "\n\n" if banner else "") + _tel_line
+        alerts = (alerts + "\n\n" if alerts else "") + _tel_line
+    # 同源提示（轮次台账）：v2 统一到告警段（旧版在静态检查+清单两处重复呈现）。
+    if ledger and ledger.get("lineage"):
+        _entries = [e for e in ledger.get("lineage", []) if isinstance(e, dict) and "number" in e]
+        if _entries:
+            hist = "、".join(f"#{e['number']}（{e.get('rounds', '?')} 轮）" for e in _entries)
+            _lin = (f"⚠️ 与已关闭的 {hist} 内容同源：历史已消耗 {ledger.get('rounds_spent', 0)} 轮，"
+                    f"未销项 {len(ledger.get('inherited_open_items', []))} 条已并入本清单，"
+                    f"剩余轮次按台账计。人工重置请打 `rounds-reset` label。")
+            alerts = (alerts + "\n\n" if alerts else "") + _lin
+    # 机器 marker 段：loop 状态 marker + checklist 权威状态 marker（机读，永远存在）。
     markers = []
     if loop_info:
-        decision, reason, marker = loop_info
-        head = {"continue": "🔁 继续", "converged": "✅ 收敛",
-                "escalate": "⬆️ 升级到人"}[decision]
-        banner = f"**反馈循环：{head}** — {reason}" + ("\n\n" + banner if banner else "")
-        markers.append(marker)
+        markers.append(loop_info[2])           # loop state marker（render_status_line 用 loop_info[0/1]）
+    if checklist:
+        markers.append(checklist_mod.render_marker(checklist))
     # 验证档（verification_decision）是机器路由信号——决定 CI 跑哪档验证，非给人的待办；降为行尾小字。
     _VD = {"cheap_only": "仅基础检查（不额外跑验证）",
            "targeted_tests": "针对性验收测试",
            "full_suite": "完整验证（针对性测试 + 变异测试）"}
     _vd = risk.get("verification_decision")
     run_link = _run_link()
-    # 本段只在有真有用信息时才出现——链接为主、验证档降小字；LLM 失败时把具体可靠的
+    # 参考信息「验证与日志」<details>：链接为主、验证档降小字；LLM 失败时把具体可靠的
     # 原始错误（PR#68 做准的 reason）详列在此（CAUTION 只给精简指向）。
     _vblocks = []
     if run_link:
@@ -268,10 +281,10 @@ def post_results(owner, repo, number, head_sha, token, risk, findings, loop_info
     _ed_block = _render_engine_detail(engine_status, engine_detail)
     if _ed_block:
         _vblocks.append(_ed_block)
-    verification_md = ("### 验证与日志\n\n" + "\n\n".join(_vblocks)) if _vblocks else ""
-    body = render_report(risk, findings, banner=banner, scope_facts=scope_facts,
-                         checklist_md=checklist_md, verification_md=verification_md,
-                         markers="\n".join(markers), lineage=ledger,
+    body = render_report(risk, findings, alerts=alerts, scope_facts=scope_facts,
+                         checklist=checklist, rounds_left=rounds_left, loop_info=loop_info,
+                         verification_blocks=_vblocks,
+                         markers="\n".join(markers), gate_line="",
                          review_reliable=review_reliable, engine_status=engine_status,
                          ai_raw_count=ai_raw_count, added_lines=added_lines, engine_detail=engine_detail)
     # 机读 result marker（隐藏）——校准/自治经验从 API 重建数据的入口
@@ -559,10 +572,10 @@ def main():
         findings, rule_index, state, ci_passed=ci_pass,
         checklist_pair=(prev_cl, cur_cl), ledger=ledger, review_reliable=reliable)
     loop_info = (decision, reason, loop.render_marker(new_state))
-    checklist_md = checklist_mod.render(
-        cur_cl, rounds_left=loop.remaining_rounds(
-            cur_cl.get("round", 0), ledger.get("rounds_left", loop.MAX_ROUNDS)),
-        lineage=ledger)
+    # v2：可见清单渲染由 render_report 内 render_findings_checklist 统一负责（合并 AI 评审 +
+    # 清单）；此处只算 rounds_left 供状态行/台账用，不再预算 checklist_md。
+    _rounds_left = loop.remaining_rounds(
+        cur_cl.get("round", 0), ledger.get("rounds_left", loop.MAX_ROUNDS))
 
     # 变更分类（供自治经验层/auto_merge）：touchstone 侧此时已知 risk/findings/changed_files
     cls = autonomy.change_class(risk, findings, sorted(changed_files), rule_index)
@@ -687,7 +700,8 @@ def main():
                  shadow_types=shadow_types, shadow_experience_ids=shadow_experience_ids,
                  engine_status=engine_status, det_warning=det_warning,
                  ai_raw_count=ai_raw_count, added_lines=added_lines, n_changed=n_changed,
-                 scope_facts=scope_facts, checklist_md=checklist_md, ledger=ledger,
+                 scope_facts=scope_facts, checklist=cur_cl, rounds_left=_rounds_left,
+                 ledger=ledger,
                  review_reliable=reliable, llm_notes=llm_notes,
                  raw_excerpt=raw_excerpt, unverified_claims=n_unverified,
                  telemetry_status=_tel_res, engine_detail=engine_detail)

@@ -19,6 +19,18 @@ checks:
     source_check: "unit"          # ← 改成你们单测 check 的实际名字
     required: false
 
+  # 转达：gitleaks 密钥/敏感信息扫描（SEC-001 确定性门禁的高召回补位）
+  # 分工：SEC-001 内置只保留高精度特征串（AKIA/ghp_/sk-/PEM 等），gitleaks 负责
+  #       熵分析 + 路径 allowlist + IP/密码自定义规则——见 .gitleaks.toml。
+  # 时序（方案 3）：touchstone.yml 里 touchstone job needs gitleaks → 本 relay 跑时
+  #   gitleaks check-run 已完成，无"未完成"假 failure。
+  # fail-closed：required 下 gitleaks 未跑/失败 → 总闸 failure（安全闸不该因缺数据放行）。
+  - name: gitleaks
+    type: relay
+    source_check: "gitleaks"      # 与 gitleaks-action 产出的 check-run 名一致
+    required: true
+    # allow_skipped: true         # 罕见：若某些 PR 确需跳过 gitleaks（纯文档/自动生成），置此放宽
+
   # 转达：SonarQube 结论（先不设必须；没接就关掉）
   - name: sonarqube
     type: relay

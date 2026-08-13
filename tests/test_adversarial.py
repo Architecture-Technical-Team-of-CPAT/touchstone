@@ -55,11 +55,14 @@ def test_sec001_genuine_key_not_evasionable_by_context():
     assert any(x["rule_id"] == "SEC-001" for x in f)
 
 
-def test_sec001_skips_test_fixtures():
-    """测试文件里的密钥是夹具，不据此阻断（真实泄密由外部 SAST 兜底）。"""
+def test_sec001_test_file_downgrades_to_warn():
+    """零路径盲区：测试文件不再跳过（防藏匿通道）。真值 key 在 test 文件 → 降级 warn（可见不阻断）。"""
     ridx = _rule_index()
     added = {"tests/test_x.py": [(1, 'key = "AKIAABCDEFGHIJKLMNOP"')]}
-    assert contract_check.check_secrets(added, ridx) == []
+    f = contract_check.check_secrets(added, ridx)
+    sec = [x for x in f if x["rule_id"] == "SEC-001"]
+    assert sec, "test 文件中的疑似凭据应被检出（不再跳过）"
+    assert sec[0]["severity"] == "warn", "test 文件命中须降级 warn、不阻断"
 
 
 # ---------------- 经验投毒：active 经验的 suppress 不能绕过确定性门禁 ----------------
@@ -241,11 +244,13 @@ def test_danger_pattern_closes_eval_bypass_even_when_llm_empty():
 
 
 def test_CHARACTERIZES_eval_in_test_fixture_still_bypasses_danger_skip():
-    """【刻画当前行为·残余设计限制】DANGER-001 与 SEC-001 一致跳过测试文件（_is_test），
-    故 eval 出现在【测试文件】里不被确定性抓到 + LLM 空回 → 仍落 low-risk 放行。
-    刻意保留此跳过：测试文件里的 eval 多为夹具/演示，不进生产；生产代码（非 test 路径）的
-    eval 由 test_danger_pattern_closes_eval_bypass_even_when_llm_empty 守住。本测试锁死残余 gap
-    防回归——若将来放开 test 跳过，此断言会提醒同步评估语义。"""
+    """【刻画当前行为·残余设计限制】DANGER-001 仍跳过测试文件（_is_test），故 eval 出现在
+    【测试文件】里不被确定性抓到 + LLM 空回 → 仍落 low-risk 放行。刻意保留此跳过：测试文件里
+    的 eval 多为夹具/演示，不进生产、非泄露通道；生产代码（非 test 路径）的 eval 由
+    test_danger_pattern_closes_eval_bypass_even_when_llm_empty 守住。
+    注：SEC-001 已不再跳过测试文件（密钥可藏匿于 test 目录，改为扫 + 降级 warn，见同文件
+    test_sec001_test_file_downgrades_to_warn）；DANGER-001 仍跳过——二者对 test 文件
+    的处理已分化（eval 在 test 里合法常见，盲区论点不适用）。本测试锁死 DANGER-001 残余 gap 防回归。"""
     from touchstone import orchestrator as orc
     from touchstone import review_provider as RP
     pr = _pr([("tests/test_eval.py", ["result = eval(user_input)"], True)], _empty_llm())

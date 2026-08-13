@@ -225,6 +225,65 @@ pr-agent **取 PR** 用 workflow 自带的 `GITHUB_TOKEN`——**无需额外配
 
 这样人一眼就能看出"这次到底有没有 AI 评审",不会被空评审误导。
 
+## 让评审懂你的团队：手写规范与学习回路
+
+Touchstone 评审默认用通用规则。让评审**懂你团队的特定规范**有两条路径——按需选一或叠加：
+
+| | 路径 A：手写规范种子 | 路径 B：学习回路（TF-GRPO） |
+|---|---|---|
+| 见效 | 立即（下次评审即注入） | 需积累历史 PR + graduate 达标 |
+| 来源 | 人手写 | 从历史 PR 的采纳/忽略自动学 |
+| 共享范围 | 本仓私有 | 跨仓共享（引擎经验库） |
+| 基础设施 | 无 | learn.yml + 旗舰模型端点（TF-GRPO） |
+| 防投毒闸 | 不走（仓内配置，受合并权限保护） | 走 `TOUCHSTONE_EXPERIENCE_REF` |
+
+### 路径 A：手写团队规范 `.touchstone/seeds.yaml`（立即生效、零基础设施）
+
+不想跑学习回路、也不想等 graduate 达标的团队，在自己仓库放一份 `.touchstone/seeds.yaml`——手写的团队规范在评审时**直接注入** PR-Agent 提示词。
+
+> **注意区分**：这是 consumer-repo 的注入配置（`.touchstone/seeds.yaml`，由 `touchstone/seed_loader.py` 读取并注入 PR-Agent 提示词）。它与 `.github/workflows/seed.yml` / `examples/seed_experiences.py`（路径 B 用来 bootstrap **引擎经验库**的脚本与工作流）是两套独立机制——名字像但不是一回事，详见下方路径 B 的「graduate 阈值」。
+
+**3 步启用：**
+
+1. 在你的消费方仓创建 `.touchstone/seeds.yaml`（格式见下；完整样例与 threat-model 注释参考[本仓 `.touchstone/seeds.yaml.example`](./.touchstone/seeds.yaml.example)）。
+2. 按团队规范编辑。
+3. 提交到仓库（随仓版本化，受 PR 合并权限保护）。
+
+**格式**（YAML 列表，每项一条规范）：
+
+```yaml
+- finding_type: PRA-ERROR-SWALLOW   # 规范类型标识（与评审发现的 rule_id 对齐）
+  kind: emphasize                   # emphasize=多盯紧 / suppress=少挑或不挑
+  stack: python                     # 可选，技术栈过滤（留空或不写=对所有栈生效）
+  text: Flag bare `except:` and empty catch blocks; they swallow errors silently.
+
+- finding_type: PRA-NIT
+  kind: suppress
+  text: Don't raise formatting nits; the linter/formatter handles them.
+```
+
+**生效条件**：`TOUCHSTONE_EXPERIENCE_ENABLED` 未显式置 `false`（默认 `true`）。无需 learn.yml、无需经验库、无需旗舰模型。`text` 走长度封顶（限注入面）、评审输出 advisory-only（无合入权）、code review 三层缓解 prompt 注入风险。
+
+### 路径 B：学习回路 / TF-GRPO（从历史 PR 自动学、跨仓共享）
+
+学习回路统计"人最终采纳了哪些发现、忽略了哪些"，把规律蒸馏成自然语言经验，加进 PR-Agent 提示词。它**离线跑**（和评审分开，出问题不影响评审）、**经验只调建议不碰合入**、**新经验先 shadow A/B 达标才启用**。
+
+**两档**（蒸馏器经 env `TOUCHSTONE_DISTILLER` 按名切换）：
+
+- **计数式**（默认、已生产实跑）：统计采纳率，不训练模型、不改权重。
+- **TF-GRPO**（更强、离线可测）：策略冻结 + 组内语义优势把经验蒸馏成注入提示词的 token prior（取自 arXiv 2510.08191，机制见 `docs/learning-loop-design.html` 第 3 节）。
+
+**启用步骤**（详见 `.github/workflows/learn.yml`）：
+
+1. **配 LLM + 旗舰模型端点**（Secrets）：评审同款的 `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`；TF-GRPO 的生成与内省另需 `TOUCHSTONE_FLAGSHIP_MODEL`（参数固定的旗舰模型名）。计数式不需要旗舰模型。
+2. **跑 `learn.yml`**：默认每周一 UTC 02:00 定时跑，也支持 `workflow_dispatch` 手动触发。流程：从已合 PR 重建真值集（窗口由 `TOUCHSTONE_GT_WINDOW` 控制，默认 200）→ 蒸馏候选经验 → 有变化时推 `bot/experience-update` 分支并开 PR。
+3. **经验 PR 合入**：经 `gate` 绿 + 仅含 `data/*.json` + head 匹配触发 run 时，由 `bot-pr-merge.yml` 自动合入（B3，避免直接 push main 的 non-fast-forward 失败）。
+4. **防投毒闸**：跨仓共享的引擎经验库经 `TOUCHSTONE_EXPERIENCE_REF` 闸——只接受指定 ref 的经验、拒绝 PR-head 投毒。
+
+**graduate 阈值**：经验需"见过 ≥20 个采纳 + ≥20 个忽略 + 采纳率提升 ≥0.10"才正式启用（防噪声经验过早注入）。因为经验是人能读写的自然语言，**人能直接干预**：手写种子（`seed.yml` / `examples/seed_experiences.py`）、审校候选、立红线（受保护类型永不 suppress、`locked` 经验不被回路改写/退役）、调奖励权重——见 `docs/learning-loop-design.html` 第 6 节。蒸馏器**可插拔**：`register_distiller` 注册自有实现、`TOUCHSTONE_DISTILLER` 切换，`_distill_via_llm` 的 rollout/score/distill 三步也可单独注入。
+
+> **两条路径叠加**：seeds.yaml（本仓私有、立即）与引擎经验库（跨仓共享、学来的）分层共存，都受 `TOUCHSTONE_EXPERIENCE_ENABLED` 总闸控制。多数团队先用路径 A 快速固化规范，等历史 PR 积累够了再开路径 B。
+
 ## 仓库结构
 
 ```
