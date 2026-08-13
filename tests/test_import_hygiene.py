@@ -90,7 +90,8 @@ def test_no_syspath_poisoning_in_tests():
 
 
 def test_render_reexport_compat():
-    """orchestrator.render_* 再导出路径保持兼容（外部调用与既有测试不需改动）。"""
+    """orchestrator.render_* 再导出路径保持兼容（外部调用与既有测试不需改动）。
+    v2：render_facts/render_findings 已随版面合并移除，再导出仅含仍存在的函数。"""
     from touchstone import orchestrator, render
-    for name in ("render_facts", "render_findings", "render_report", "render_summary"):
+    for name in ("render_report", "render_summary"):
         assert getattr(orchestrator, name) is getattr(render, name)

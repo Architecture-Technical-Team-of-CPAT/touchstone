@@ -164,8 +164,7 @@ def loop_step(findings, rule_index, state, max_rounds=MAX_ROUNDS, ci_passed=None
             open_n = sum(1 for i in cur_cl.get("items", []) if i["status"] == "open")
             return ("escalate", f"轮次耗尽（≥ {max_rounds}）仍有 {open_n} 条未销项 → 交人",
                     LoopState(nr, hist, ci_passed))
-        return ("continue",
-                f"第 {nr} 轮，清单销项率 {int(cur_cl.get('resolved_rate', 0) * 100)}%，待 author 逐项申报",
+        return ("continue", "待 author 逐项申报",
                 LoopState(nr, hist, ci_passed))
 
     # 收敛：无可自改发现。但若【已知 CI/verify 为红】则不算改完——提示 author 接着修。

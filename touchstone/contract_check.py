@@ -174,36 +174,61 @@ _SECRET_PATTERNS = [
 _PLACEHOLDER = re.compile(
     r"(example|sample|changeme|changed?|placeholder|todo|xxxx|<[^>]+>|your[_-]?\w*"
     r"|_here\b|redacted|test|dummy|fake|replace[_-]?me)", re.I)
+# 测试文件用的占位符过滤：去掉 "test"——真凭据若含 "test" 子串（如 ghp_test…/测试环境密钥）
+# 不该被当占位值放行，否则正好挫败"抓 test 目录真凭据"的目标（PRA-POSSIBLE_ISSUE 修复）。
+# example/changeme/<...>/dummy 等通用占位词仍过滤——只有 "test" 子串不再豁免 test 文件。
+_PLACEHOLDER_NO_TEST = re.compile(
+    r"(example|sample|changeme|changed?|placeholder|todo|xxxx|<[^>]+>|your[_-]?\w*"
+    r"|_here\b|redacted|dummy|fake|replace[_-]?me)", re.I)
 
 
 def check_secrets(added, rule_index):
     """SEC-001：扫新增行里的硬编码密钥/凭据（确定性、离线）。仅当 SEC-001 在册且 machine_checkable 时生效。
-    产 finding(agent=contract-check, category=security, severity 取自规则=block_candidate) → 自动进确定性门禁。"""
+    产 finding(agent=contract-check, category=security, severity 取自规则=block_candidate) → 自动进确定性门禁。
+
+    零路径盲区（与 .gitleaks.toml 零路径排除同构）：测试文件不再无条件跳过——否则
+    员工把真凭据塞进 test 目录即可绕过确定性门禁（蓄意藏匿通道）。test 文件里的命中
+    降级 severity=warn（报告可见、不阻断），由人复核；占位符仍先过滤（example/changeme/<...> 等）。
+    注：test 文件用 _PLACEHOLDER_NO_TEST——不过滤 "test" 子串，防含 test 的真凭据（ghp_test…）
+    被当占位放行而挫败本检查目标（PRA-POSSIBLE_ISSUE 修复）。"""
     rule = rule_index.get("SEC-001", {})
     if not rule.get("machine_checkable"):
         return []
     out = []
     for path, lines in added.items():
-        if _is_test(path):
-            continue            # 测试文件里的密钥是故意夹具，不据此阻断（真实泄密仍由外部 SAST 兜底）
+        is_test_path = _is_test(path)
+        placeholder = _PLACEHOLDER_NO_TEST if is_test_path else _PLACEHOLDER
         for lineno, text in lines:
             for pat, label in _SECRET_PATTERNS:
                 m = pat.search(text)
                 if not m:
                     continue
                 matched = m.group(1) if m.groups() else m.group(0)
-                if _PLACEHOLDER.search(matched):       # 示例/占位值 → 跳过
+                if placeholder.search(matched):       # 占位/示例值 → 跳过（test 文件不过滤 "test" 子串）
                     continue
-                out.append(_finding("SEC-001", path, lineno, "security",
-                                    f"疑似硬编码凭据（{label}）—— 安全红线，凭据应走密钥管理",
-                                    "将凭据移至环境变量/密钥管理服务；代码中勿入硬编码凭据",
-                                    rule_index))
+                if is_test_path:
+                    # 测试文件降级 warn：可见不阻断。SEC-001 severity=block_candidate，
+                    # 但显式 severity 优先（且 SEC-001 非 enforced，不被强制升 block）。
+                    out.append(_finding("SEC-001", path, lineno, "security",
+                                        f"测试文件中出现疑似凭据（{label}）——已降级 warn 不阻断。"
+                                        "请确认是测试夹具而非真实凭据泄露（若系真凭据须立即移除并轮换）",
+                                        "若是夹具改用明显占位值（含 example/changeme 等字样即被过滤；"
+                                        "注：test 文件不再按 'test' 子串放行，防真凭据藏匿）；"
+                                        "若是真凭据移至密钥管理并轮换",
+                                        rule_index, severity="warn"))
+                else:
+                    out.append(_finding("SEC-001", path, lineno, "security",
+                                        f"疑似硬编码凭据（{label}）—— 安全红线，凭据应走密钥管理",
+                                        "将凭据移至环境变量/密钥管理服务；代码中勿入硬编码凭据",
+                                        rule_index))
                 break                                   # 一行最多报一条
     return out
 
 
 # --- DANGER-001：危险代码构造（eval/exec/shell 注入/os.system/pickle）--------------
-# 与 SEC-001 同构（正则扫新增行、跳测试文件、category=security），但：
+# 与 SEC-001 部分同构（正则扫新增行、category=security），但【对测试文件的处理不同】：
+#   • 仍跳过测试文件——eval/exec/启用 shell 在测试里合法常见（测这些特性的代码、沙箱演示），
+#     非泄露通道，盲区论点不适用；而 SEC-001 的密钥可藏匿于 test 目录，故 SEC-001 改为扫 + 降级 warn；
 #   • 不走 _PLACEHOLDER 过滤——这些是【构造本身】危险，非"值像凭据"，没有占位符概念；
 #   • severity=warn（规则侧）、confidence=0.9——构造有少量合法用途，不一刀切 block，只升 high+full_suite；
 #   • 定位是 SEC-002（污点注入，需 SAST 数据流）的廉价前置兜底：构造出现即风险，不等数据流证实。
@@ -222,7 +247,8 @@ _DANGER_PATTERNS = [
 
 def check_danger_patterns(added, rule_index):
     """DANGER-001：扫新增行里的危险代码构造（确定性、离线）。与 check_secrets 同构：仅当 DANGER-001
-    在册且 machine_checkable 时生效；跳过测试文件（与 SEC-001 一致——测试夹具里的 eval 不进生产）。
+    在册且 machine_checkable 时生效；仍跳过测试文件（eval/exec 在测试里合法常见、非泄露通道——
+    与 SEC-001 不同：SEC-001 现扫测试文件并降级 warn，因密钥可藏匿于 test 目录）。
     产 finding(agent=contract-check, category=security, severity 取自规则=warn, confidence=0.9)
     → security 类别进 map_verdict 升 high+full_suite：LLM 空回/误判时仍兜住，关上"非 java 坏代码全押 LLM"窗口。"""
     rule = rule_index.get("DANGER-001", {})

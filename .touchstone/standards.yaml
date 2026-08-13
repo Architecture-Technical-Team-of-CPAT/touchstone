@@ -215,7 +215,7 @@ rules:
     description: 新增行出现 eval/exec/启用 shell/os.system/pickle.load 等危险代码构造。
     rationale: 构造存在即高风险（任意代码执行/命令注入/反序列化 RCE），可纯正则检出，是 SEC-002 污点分析的廉价前置兜底。
     author_guidance: 优先用安全替代（ast.literal_eval 替 eval；subprocess 用列表参数勿启用 shell；json 替 pickle）；确需使用须在 PR 说明可信边界。
-    detect_hint: contract_check.check_danger_patterns 正则扫新增行；跳过测试文件（与 SEC-001 一致）。
+    detect_hint: contract_check.check_danger_patterns 正则扫新增行；仍跳过测试文件（eval/exec 在测试里合法常见、非泄露通道；与 SEC-001 不同——SEC-001 现扫测试文件并降级 warn，因密钥可藏匿于 test 目录）。
 
   # ===== contract · 契约（class-2）=====
   - id: CTR-001

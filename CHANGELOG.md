@@ -7,20 +7,61 @@
 
 （下个版本的新变更记于此。）
 
+## [0.2.7] — 2026-08-13（gitleaks relay/CLI 修复 + SEC-001 去测试盲区 + 评审报告去冗余）
+
+本版本同步上游 AKDI-SE/touchstone v0.2.7（PR 编号引用上游 #172–#176；CPAT fork 对应本仓同步 PR）。
+
+### gitleaks 挂为 SEC-001 高召回补位（#173）
+
+确定性 SEC-001 内置扫描（AKIA/ghp_/sk-/PEM 等高精度特征串）之外，新挂 gitleaks 作高召回补位——熵分析 + 云凭据默认规则 + IP/密码自定义规则。gitleaks 产独立 check-run `gitleaks`，经 `checks.yaml` 的 `type: relay` 折进总闸（按名读 check-run 结论，fail-closed）。
+
+- **同工作流 needs: 时序**：gitleaks 与评审、门禁在同一工作流，`needs: gitleaks` 等其完成（无论成败）后才跑 relay——消除跨工作流时序的「未完成」假 failure。
+- **规则级 allowlist 收窄**：值过滤（占位符正则、私网 IP 段）下沉到各 `[[rules.allowlists]]`，不全局 paths 跳文件。
+
+### SEC-001 去掉测试文件无条件跳过——防 test 目录成藏匿通道（#174）
+
+`check_secrets` 旧版 `if _is_test(path): continue` 对测试文件无条件跳过 → 员工把真凭据塞 test 目录即绕过 SEC-001（蓄意藏匿通道）。改为：测试文件照样扫，命中降级 `warn`（可见、不阻断）——「宁可多看一眼，不可漏一个」。
+
+- **`_PLACEHOLDER_NO_TEST` 新增**：测试文件不再按 `test` 子串放行（旧 `_PLACEHOLDER` 含 `test`，`ghp_test…` 真凭据被当占位过滤）；通用占位词（example/changeme 等）仍过滤。
+- **DANGER-001 分化注记**：DANGER-001 仍跳过测试文件（eval/exec 在测试里合法常见、非泄露通道）；`standards.yaml` 的 detect_hint 标注二者对 test 文件的分化处理。
+- 测试：`test_contract.py` / `test_adversarial.py` 新增 test 文件降级 warn、`example` 占位过滤、含 `test` 子串真凭据被检出等回归测试。
+
+### gitleaks 改 CLI 直跑 + 零路径排除（#175）
+
+**修阻塞所有 PR 的总闸 bug**：gitleaks-action@v2 不支持 `pull_request_target` 事件（硬限制「The event is not yet supported」）→ 在本工作流触发器下恒 error → relay fail-closed → 总闸恒失败、阻塞所有 PR。改用 gitleaks CLI（v8.30.1）+ `actions/github-script` 手动建 check-run `gitleaks`，保留同工作流 needs: 时序保证。
+
+- **零路径排除**：删全局 `[[allowlists]] paths = [...]`（tests/mocks/fixtures/vendor/`*.md`/`*.lock` 无条件跳文件）。paths 是不扫内容的藏匿通道——真凭据塞 test 目录即绕过。改全文件扫描 + 值过滤（占位符正则、熵阈值）治假阳性。规则级 allowlists（IP 私网段、密码占位词）保留。
+- **Bootstrap 注记**：本 PR 自身的 gitleaks check-run 跑的是合并前 main 的旧 action 版（pull_request_target 用 base 版工作流），故显示 failure——预期 chicken-and-egg；合并后下一个 PR 起走新 CLI 版。
+
+### 评审报告版面重设计：七段 → 六段（去冗余）
+
+基于 PR #170–#171 多轮评审观察，对评审报告版面做去冗余重设计——七段合六段，保留 GitHub 原生 checkbox。版面是一等设计资产（`templates/review_report.md`），代码只填充。
+
+- **① 状态行合并（观测 1+6）**：旧版「① 横幅（反馈循环行）+ ② 态势（风险等级行）」两段合为一行 blockquote——循环决策（继续/收敛/升级）· 轮次 · 剩余轮数 · 销项率 · 风险等级。escalate 的升级理由有诊断价值保留；continue/converged 的理由是轮次/销项率的复述，已在状态行结构化呈现、不复读。`render_report` 接口变更：`banner=` → `alerts=`（循环行归①状态行，`alerts` 只留降级/CAUTION/溯源/同源提示）；新增 `loop_info=`、`checklist=`、`rounds_left=` 传给 `render_status_line`。
+- **③ 静态检查精简（观测 7）**：删除「修改范围」（文件数/增删行，与 PR UI 统计重复）；「规则命中」详情并入④。仅保留敏感路径命中 + 门禁状态；**无内容时整段省略**（简单 PR 零噪声）。
+- **④ 评审发现与销项合一（观测 2+3+4）**：AI 评审 + 待解决问题清单合为一段。所有发现（确定性规则命中 + LLM 建议）作为 `- [ ]` task list（GitHub 渲染成可勾选框），sig 兼作位置与 ack 锚点（不再单列位置/锚点行）。删除「销项跟踪：…见上方」样板（详情已在同段）。开放项在前（按置信降序）、已销项在后；大 PR 封顶列出（避免撑破 GitHub 65536 字符限）。findings↔checklist 按 sig join：开放项有当前 finding（完整详情），已销项项可能无（用清单存储的历史快照 sparse 显示）。
+- **⑤ 参考信息折叠（观测 5）**：验证/日志 + 申报指引全部 `<details>` 折叠（默认不占屏）；空清单时省申报指引。
+- **`<details>` 折叠回归修复（#168 遗漏两处，随 v2 修复）**：① `_render_reasoning` 的 body/`</details>` 缩进参数化（`indent` + 2），兼容编号列表（3 空格）与 task list（2 空格）——body 脱出子列表项内容区会让 HTML block 截断、折叠失效；② 申报指引 `<details>` 内去空行（type-6 HTML block 遇空行即终止）、内联代码改 `<code>` 标签。
+- **保留 checkbox**：用户明确要求保留 GitHub 原生 `- [ ]`/`- [x]` task list（不退化成编号列表 + emoji）。状态标签 ⬜/✅/🟡 在 checkbox 基础上加四态语义（待处理/已复核销项/待人核准豁免/待人核准拆出）。
+- **代码清理**：移除 v1 的 `_finding_entry`/`render_facts`/`render_findings`/`_location` 四个死函数（版面合并后不再被生产路径调用）；`checklist.py` 的 `render()`/状态常量迁至 `render.py`（呈现层归呈现层），`checklist.py` 只保留数据层（`render_marker` 产机读 JSON）；`orchestrator.post_results` 接口变更（`checklist_md=` → `checklist=, rounds_left=`）；`sig_of` 在 `line=None` 时省略行段（v2 sig 兼作位置显示，防 `:None` 渗入版面）。
+- 测试：`test_revision_items.py` 全部 v1 单发现渲染测试改驱动 v2 函数（`_render_done_criteria`/`_render_reasoning`/`render_findings_checklist`）；新增状态行合并、清单合一、销项率封顶等回归测试。1151 passed、11 skipped（4 个 `mutation_check` 测试因环境缺 `python` 可执行文件预存失败，与本变更无关）。
+
+
+
 ## [0.2.6] — 2026-08-09（`<details>` 渲染修复 + summary 露关键信息预览）
 
-本版本同步上游 AKDI-SE/touchstone v0.2.6：修复评审报告里 `<details>` 折叠区「点击展开」无反应的回归（自 v0.2.2 #158 长依据折叠起即存在），并把折叠 summary 从无信息标签升级为首句预览。
+本版本修复评审报告里 `<details>` 折叠区「点击展开」无反应的回归（自 v0.2.2 #158 长依据折叠起即存在），并把折叠 summary 从无信息标签升级为首句预览——author 扫清单时不展开也能判读依据要点。
 
-### `<details>` 折叠渲染修复（上游 #168，修 #167）
+### `<details>` 折叠渲染修复（#168，修 #167）
 
-- **去空行修「点击展开」无反应**：`<details>` 是 CommonMark type-6 HTML block，遇空行即终止。此前 summary 与 body 间、body 与 `</details>` 间各有一空行 → `<details>` 在首个空行处被截断成孤立开标签，body 变成始终可见的松散段落、`</details>` 变孤立闭标签，表现即「点击展开」点了没反应。去空行让整段留在同一 HTML block 内。此 bug 自 v0.2.2（#158 长依据折叠）起影响所有评审的长依据折叠。
+- **去空行修「点击展开」无反应**：`<details>` 是 CommonMark type-6 HTML block，遇空行即终止。此前 summary 与 body 间、body 与 `</details>` 间各有一空行 → `<details>` 在首个空行处被截断成孤立开标签，body 变成始终可见的松散段落、`</details>` 变孤立闭标签，表现即「点击展开」点了没反应（#167 review 实测回归）。去空行让整段留在同一 HTML block 内，`<details>` 才是完整可折叠元素。此 bug 自 v0.2.2（#158 长依据折叠）起影响所有评审的长依据折叠。
 
 ### summary 露首句预览（关键信息可见）
 
-- **`<details>` summary 从「依据（N 字，点击展开）」升级为首句预览**：summary 不再是无信息标签，而是露核心论断，author 扫清单时不展开也能判断依据是否值得细读。
-- **句末判定**：CJK 全角（。！？）无条件算句末；ASCII 半角（`.!?`）仅在后接空白/串尾时算——否则版本号（`0.2.3`）、小数、缩写（`e.g.`）、域名里的 `.` 会被误判。截断处加 `…`。已知局限：ASCII 句号直连 CJK（无空格）与缩写（e.g./i.e.）不被精确识别——属轻量句切分的固有边角，全文始终在 body 内不影响判读。
-- **body 折叠空白防内部空行**：body 嵌入前 `re.sub(r"\s+", " ", reasoning).strip()` 折叠成单行——内容一字不丢。
-- **两条硬约束均满足**：(a) 非动态获取——summary 与 body 均静态嵌入 markdown；(b) 不影响 API 取全量 review 意见——全文始终在 details body 内，`<!-- touchstone-checklist -->` 结构化标记不受影响。
+- **`<details>` summary 从「依据（N 字，点击展开）」升级为首句预览**（用户 #168 续——「计划把关键信息的 summary 展示出来，其他通过点击详情按钮来展开」）：summary 不再是无信息标签，而是露核心论断（如「版本号 0.2.3→0.2.5 跳过了 0.2.4」），author 扫清单时不展开也能判断依据是否值得细读。
+- **句末判定**：CJK 全角（。！？）无条件算句末；ASCII 半角（`.!?`）仅在后接空白/串尾时算——否则版本号（`0.2.3`）、小数、缩写（`e.g.`）、域名里的 `.` 会被误判（实测在「版本号从 0.」处截断）。截断处加 `…`；首句超 `_TEASER_MAX`（60）则硬截断。已知局限：ASCII 句号直连 CJK（无空格）与缩写（e.g./i.e.）不被精确识别——属轻量句切分的固有边角，teaser overrun 到 max_len 硬截断，全文始终在 body 内不影响判读。
+- **body 折叠空白防内部空行**：reasoning 自带空行（多段依据/含 `\n\n` 的代码片段）同样会截断 HTML block。body 嵌入前 `re.sub(r"\s+", " ", reasoning).strip()` 折叠成单行——内容一字不丢，仅丢多段排版（折叠区显示形态本就不重要）。
+- **两条硬约束均满足**（用户原话）：(a) 非动态获取——summary 与 body 均静态嵌入 markdown，点击展开零网络请求；(b) 不影响 API 取全量 review 意见——全文始终在 details body 内，`<!-- touchstone-checklist -->` 结构化标记不受影响，折叠仅改 GitHub UI 默认展开态、不丢一字。
 
 ## [0.2.5] — 2026-08-06（adopted 信号放宽 + 消费方团队规范种子）
 

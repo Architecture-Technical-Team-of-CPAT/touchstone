@@ -6,6 +6,7 @@ import re
 
 from touchstone import orchestrator as orc
 from touchstone import review_provider as rp
+from touchstone import checklist as cl
 
 
 # ---- 录制的 golden 夹具：贴近真实 pr-agent improve+review 输出 + 一个含多类改动的 diff ----
@@ -49,7 +50,8 @@ def test_e2e_replay_produces_stable_comment_structure(monkeypatch):
     findings, risk = out["findings"], out["risk"]
     orc.post_results("o", "r", 42, "deadbeef", "tok", risk, findings,
                      loop_info=("converged", "无可自改", "<!-- touchstone-loop: {} -->"),
-                     change_class="high|code|security|security_surface", diff=GOLDEN_DIFF)
+                     change_class="high|code|security|security_surface", diff=GOLDEN_DIFF,
+                     checklist=cl.from_findings(findings))
 
     body = posted["body"]
     # —— 人可读结构稳定 ——
