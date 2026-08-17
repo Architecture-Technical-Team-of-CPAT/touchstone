@@ -152,7 +152,11 @@ def _is_engine_data(p):
     可见、不阻断，由人复核。注意：不做【无条件跳过】（同零路径盲区原则——
     真凭据若被藏进数据文件仍会以 warn 可见）；路径先归一化（去 ./ 前缀、
     反斜杠 → 正斜杠）再比对——调用方传入的 diff 路径形态不受格式影响。"""
-    norm = p.replace("\\", "/").lstrip("./") if p.startswith("./") else p.replace("\\", "/")
+    norm = p.replace("\\", "/")
+    if norm.startswith("./"):                      # 只剥字面前缀（评审 round-3：lstrip 是字符集
+        norm = norm[2:]                            # 剥离,../ 也会被吃掉——变成路径遍历降级通道）
+    if ".." in norm.split("/"):                    # 任一段为 .. → 视为越界路径,不降级（走 block）
+        return False
     return norm in _ENGINE_DATA_FILES
 
 

@@ -335,3 +335,12 @@ def test_sec001_engine_data_path_normalized():
     for path in ("./data/ground_truth.json", "data\\ground_truth.json"):
         f = contract_check.check_secrets({path: [(1, f'"{_fx}"')]}, _rule_index())
         assert f and f[0]["severity"] == "warn", path
+
+def test_sec001_engine_data_rejects_traversal():
+    """../ 伪装白名单路径不降级（评审 round-3：lstrip 字符集剥离把 ../ 吃掉——
+    路径遍历降级通道）。../data/ground_truth.json → 仍 block。"""
+    _fx = "AKIA" + "ABCDEFGHIJKLMNOP"
+    for path in ("../data/ground_truth.json", "../../data/ground_truth.json",
+                 "subdir/../data/ground_truth.json"):
+        f = contract_check.check_secrets({path: [(1, f'"{_fx}"')]}, _rule_index())
+        assert f and f[0]["severity"] == "block_candidate", path
