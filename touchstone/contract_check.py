@@ -135,14 +135,25 @@ def _is_test(p):
     return "test" in p.lower() or "spec" in p.lower()
 
 
+# 已知引擎数据文件白名单（评审意见：blanket data/*.json 会被攻击者用作降级通道——
+# 把含真凭据的文件挪进 data/ 即把 SEC-001 从 block 降到 warn。收窄到引擎实际产出
+# 的两个文件名，其余 data/ 文件不降级）。
+_ENGINE_DATA_FILES = frozenset({
+    "data/ground_truth.json",        # 校准真值集（历史 PR 的 diff 文本）
+    "data/experience_store.json",    # 经验库（蒸馏语料，同含 diff 文本）
+})
+
+
 def _is_engine_data(p):
-    """引擎数据文件：data/ 下的经验库/真值集 JSON。其内容是【历史 PR 的 diff 文本】
+    """引擎数据文件：经验库/真值集（白名单精确到文件）。其内容是【历史 PR 的 diff 文本】
     （校准真值、经验蒸馏语料），diff 里合法地包含历史评审讨论过的凭据【样例串】
     （含 SEC-001 自己的测试夹具——20 位字母序样例串,此处以描述代写防扫描器自命中）。把这类文件的新增行当
     代码扫会把"引用样例"误判为"引入凭据"——与 test 文件同语义降级 warn：
     可见、不阻断，由人复核。注意：不做【无条件跳过】（同零路径盲区原则——
-    真凭据若被藏进数据文件仍会以 warn 可见）。"""
-    return p.startswith("data/") and p.endswith(".json")
+    真凭据若被藏进数据文件仍会以 warn 可见）；路径先归一化（去 ./ 前缀、
+    反斜杠 → 正斜杠）再比对——调用方传入的 diff 路径形态不受格式影响。"""
+    norm = p.replace("\\", "/").lstrip("./") if p.startswith("./") else p.replace("\\", "/")
+    return norm in _ENGINE_DATA_FILES
 
 
 def check_untested_code(files, rule_index):
@@ -220,15 +231,22 @@ def check_secrets(added, rule_index):
                 if is_test_path or is_data_path:
                     # 测试文件/引擎数据文件降级 warn：可见不阻断。SEC-001 severity=block_candidate，
                     # 但显式 severity 优先（且 SEC-001 非 enforced，不被强制升 block）。
-                    # data/*.json 内容是历史 PR diff 文本——diff 里引用的凭据样例串
+                    # 引擎数据文件内容是历史 PR diff 文本——diff 里引用的凭据样例串
                     # （评审/测试夹具）非本次引入，误判为 block 会拦截正常数据更新。
+                    if is_test_path:
+                        kind, what = "测试文件", "测试夹具"
+                        fix_hint = ("若是夹具改用明显占位值（含 example/changeme 等字样即被过滤；"
+                                    "注：test 文件不再按 'test' 子串放行，防真凭据藏匿）；"
+                                    "若是真凭据移至密钥管理并轮换")
+                    else:
+                        kind, what = "引擎数据文件", "历史 diff 样例（经验库/真值集白名单内文件）"
+                        fix_hint = ("确认为历史 diff 引用的样例串（对照上游 PR/测试夹具）；"
+                                    "若非样例而是真凭据：立即移除并轮换，且该文件不应留在"
+                                    "引擎数据白名单内")
                     out.append(_finding("SEC-001", path, lineno, "security",
-                                        f"{'测试文件' if is_test_path else '引擎数据文件'}中出现疑似凭据（{label}）"
-                                        "——已降级 warn 不阻断。"
-                                        "请确认是测试夹具/历史 diff 样例而非真实凭据泄露（若系真凭据须立即移除并轮换）",
-                                        "若是夹具改用明显占位值（含 example/changeme 等字样即被过滤；"
-                                        "注：test 文件不再按 'test' 子串放行，防真凭据藏匿）；"
-                                        "若是真凭据移至密钥管理并轮换",
+                                        f"{kind}中出现疑似凭据（{label}）——已降级 warn 不阻断。"
+                                        f"请确认是{what}而非真实凭据泄露（若系真凭据须立即移除并轮换）",
+                                        fix_hint,
                                         rule_index, severity="warn"))
                 else:
                     out.append(_finding("SEC-001", path, lineno, "security",
