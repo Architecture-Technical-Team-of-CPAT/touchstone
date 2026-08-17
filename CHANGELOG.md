@@ -9,6 +9,8 @@
 
 ## [0.2.8] — 2026-08-17（touchstone-ack 消项 skill + push-guard 机器闸 + README 审计补正）
 
+本版本同步上游 AKDI-SE/touchstone v0.2.8（PR 编号引用上游 #177–#179；CPAT fork 对应本仓同步 PR）。
+
 ### touchstone-ack 销项规程 skill（#177）
 
 新增 `skills/touchstone-ack/SKILL.md`：消费方 AI agent 与 Touchstone 评审交互的权威规程——分诊（advisory ≠ 卡合并）、申报格式（PR 级评论 touchstone-ack 围栏块）、状态语义（done/waived/split）、时序（改码→提交→发 ack→推送；纯 ack 轮空提交承载）、终局与停止线、逐条处置纪律（waived 反证质量线/僵尸窝点/消除优于加固）、合并与轮询的坑、申报前自查。附防漂移测试 `tests/test_skill_doc_sync.py`（SKILL.md 示例喂真实 `parse_acks` 解析、状态语义与实现对齐断言——文档漂移测试即红）。
