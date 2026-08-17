@@ -92,6 +92,22 @@ python -m touchstone.run --repo owner/name --pr 314 --post
 
 ## GitHub 集成
 
+### 给你的 AI agent 装上销项 skill（1 分钟）
+
+你的仓库 PR 若被 Touchstone 评审，负责写代码的 agent 需要知道如何逐条处置发现并
+申报销项——协议权威文档在 [skills/touchstone-ack/SKILL.md](skills/touchstone-ack/SKILL.md)
+（申报格式、done/waived/split 语义、复检时序、收敛与停止线）。接线方式（任选其一）：
+
+```bash
+# 方式 A：拷进你的仓（推荐——随仓版本化，agent 一定能读到）
+mkdir -p .claude/skills && cp -r /path/to/touchstone/skills/touchstone-ack .claude/skills/
+
+# 方式 B：仅在你的 AGENTS.md / CLAUDE.md 指一句（agent 按需来读正本）
+#   本仓 PR 被 Touchstone 评审；销项协议见 touchstone 仓 skills/touchstone-ack/SKILL.md
+```
+
+评审报告内嵌的申报指引为最简版；完整规程（含反博弈语义与轮询纪律）以 skill 正本为准。
+
 ### 快速部署到你的仓库（3 分钟）
 
 不需要 fork 或 clone Touchstone 代码——在你的仓库创建一个 workflow，checkout Touchstone 的 release 版本、装依赖、跑 `orchestrator.py` 即可。

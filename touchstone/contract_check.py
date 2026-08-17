@@ -135,6 +135,16 @@ def _is_test(p):
     return "test" in p.lower() or "spec" in p.lower()
 
 
+def _is_engine_data(p):
+    """引擎数据文件：data/ 下的经验库/真值集 JSON。其内容是【历史 PR 的 diff 文本】
+    （校准真值、经验蒸馏语料），diff 里合法地包含历史评审讨论过的凭据【样例串】
+    （含 SEC-001 自己的测试夹具——20 位字母序样例串,此处以描述代写防扫描器自命中）。把这类文件的新增行当
+    代码扫会把"引用样例"误判为"引入凭据"——与 test 文件同语义降级 warn：
+    可见、不阻断，由人复核。注意：不做【无条件跳过】（同零路径盲区原则——
+    真凭据若被藏进数据文件仍会以 warn 可见）。"""
+    return p.startswith("data/") and p.endswith(".json")
+
+
 def check_untested_code(files, rule_index):
     """纯 diff 事实检查（不依赖 manifest）：改动含代码文件但 diff 中无任何测试文件。
     陈述事实(置信高)、严重度仅 warn——是否真需要测试由委员会/人判。"""
@@ -197,6 +207,7 @@ def check_secrets(added, rule_index):
     out = []
     for path, lines in added.items():
         is_test_path = _is_test(path)
+        is_data_path = _is_engine_data(path)
         placeholder = _PLACEHOLDER_NO_TEST if is_test_path else _PLACEHOLDER
         for lineno, text in lines:
             for pat, label in _SECRET_PATTERNS:
@@ -206,12 +217,15 @@ def check_secrets(added, rule_index):
                 matched = m.group(1) if m.groups() else m.group(0)
                 if placeholder.search(matched):       # 占位/示例值 → 跳过（test 文件不过滤 "test" 子串）
                     continue
-                if is_test_path:
-                    # 测试文件降级 warn：可见不阻断。SEC-001 severity=block_candidate，
+                if is_test_path or is_data_path:
+                    # 测试文件/引擎数据文件降级 warn：可见不阻断。SEC-001 severity=block_candidate，
                     # 但显式 severity 优先（且 SEC-001 非 enforced，不被强制升 block）。
+                    # data/*.json 内容是历史 PR diff 文本——diff 里引用的凭据样例串
+                    # （评审/测试夹具）非本次引入，误判为 block 会拦截正常数据更新。
                     out.append(_finding("SEC-001", path, lineno, "security",
-                                        f"测试文件中出现疑似凭据（{label}）——已降级 warn 不阻断。"
-                                        "请确认是测试夹具而非真实凭据泄露（若系真凭据须立即移除并轮换）",
+                                        f"{'测试文件' if is_test_path else '引擎数据文件'}中出现疑似凭据（{label}）"
+                                        "——已降级 warn 不阻断。"
+                                        "请确认是测试夹具/历史 diff 样例而非真实凭据泄露（若系真凭据须立即移除并轮换）",
                                         "若是夹具改用明显占位值（含 example/changeme 等字样即被过滤；"
                                         "注：test 文件不再按 'test' 子串放行，防真凭据藏匿）；"
                                         "若是真凭据移至密钥管理并轮换",
