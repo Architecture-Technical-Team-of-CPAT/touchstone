@@ -298,7 +298,8 @@ def test_sec001_engine_data_json_downgrades_to_warn():
 
     背景：真值集内容是历史 PR 的 diff 文本，diff 里合法包含评审讨论过的样例凭据
     （如 SEC-001 自己的夹具,20 位字母序样例串）。block 会拦截正常数据更新。"""
-    added = {"data/ground_truth.json": [(57, '"diff": "...AWS = \\"AKIAABCDEFGHIJKLMNOP\\""')]}
+    _fx = "AKIA" + "ABCDEFGHIJKLMNOP"          # 运行时拼接：源码行不构成完整特征串（防 SEC-001 对测试数据行误挂）
+    added = {"data/ground_truth.json": [(57, f'"diff": "...AWS = "{_fx}""')]}
     f = contract_check.check_secrets(added, _rule_index())
     assert len(f) == 1
     assert f[0]["severity"] == "warn"
@@ -308,7 +309,8 @@ def test_sec001_engine_data_json_downgrades_to_warn():
 
 def test_sec001_engine_data_must_be_under_data_dir():
     """同内容不在 data/ 下 → 仍 block（降级只给引擎数据目录，不外溢）。"""
-    added = {"src/config.json": [(1, '"AKIAABCDEFGHIJKLMNOP"')]}
+    _fx = "AKIA" + "ABCDEFGHIJKLMNOP"          # 同上：拼接防源码行裸含特征串
+    added = {"src/config.json": [(1, f'"{_fx}"')]}
     f = contract_check.check_secrets(added, _rule_index())
     assert len(f) == 1
     assert f[0]["severity"] == "block_candidate"
@@ -318,3 +320,27 @@ def test_sec001_engine_data_placeholder_still_filtered():
     """data/*.json 里占位值仍被过滤（降级 ≠ 不扫）。"""
     added = {"data/experience_store.json": [(1, '"example AKIAEXAMPLESAMPLE1234"')]}
     assert contract_check.check_secrets(added, _rule_index()) == []
+
+def test_sec001_engine_data_whitelist_is_exact():
+    """白名单精确到文件：data/ 下其他 json（如 config.json）不降级——防攻击者
+    把含真凭据文件挪进 data/ 降级 SEC-001（评审 round-2 收窄）。"""
+    _fx = "AKIA" + "ABCDEFGHIJKLMNOP"
+    f = contract_check.check_secrets({"data/config.json": [(1, f'"{_fx}"')]}, _rule_index())
+    assert f and f[0]["severity"] == "block_candidate"
+
+
+def test_sec001_engine_data_path_normalized():
+    """调用方传 ./data/… 或反斜杠形态也命中白名单（评审 round-2 归一化）。"""
+    _fx = "AKIA" + "ABCDEFGHIJKLMNOP"
+    for path in ("./data/ground_truth.json", "data\\ground_truth.json"):
+        f = contract_check.check_secrets({path: [(1, f'"{_fx}"')]}, _rule_index())
+        assert f and f[0]["severity"] == "warn", path
+
+def test_sec001_engine_data_rejects_traversal():
+    """../ 伪装白名单路径不降级（评审 round-3：lstrip 字符集剥离把 ../ 吃掉——
+    路径遍历降级通道）。../data/ground_truth.json → 仍 block。"""
+    _fx = "AKIA" + "ABCDEFGHIJKLMNOP"
+    for path in ("../data/ground_truth.json", "../../data/ground_truth.json",
+                 "subdir/../data/ground_truth.json"):
+        f = contract_check.check_secrets({path: [(1, f'"{_fx}"')]}, _rule_index())
+        assert f and f[0]["severity"] == "block_candidate", path
