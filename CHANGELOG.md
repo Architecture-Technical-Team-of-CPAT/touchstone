@@ -7,6 +7,32 @@
 
 （下个版本的新变更记于此。）
 
+## [0.2.8] — 2026-08-17（touchstone-ack 消项 skill + push-guard 机器闸 + README 审计补正）
+
+### touchstone-ack 销项规程 skill（#177）
+
+新增 `skills/touchstone-ack/SKILL.md`：消费方 AI agent 与 Touchstone 评审交互的权威规程——分诊（advisory ≠ 卡合并）、申报格式（PR 级评论 touchstone-ack 围栏块）、状态语义（done/waived/split）、时序（改码→提交→发 ack→推送；纯 ack 轮空提交承载）、终局与停止线、逐条处置纪律（waived 反证质量线/僵尸窝点/消除优于加固）、合并与轮询的坑、申报前自查。附防漂移测试 `tests/test_skill_doc_sync.py`（SKILL.md 示例喂真实 `parse_acks` 解析、状态语义与实现对齐断言——文档漂移测试即红）。
+
+### push-guard 推送机器闸（#178）
+
+`scripts/push-guard.sh`——git pre-push 钩子，拦截「推送到已合并/已关闭 PR 的分支」（push 静默成功、提交永不进 main 的事故通道）。经 Touchstone 评审 9 轮 26 条发现淬炼：
+
+- **凭据安全**：token 不进 argv（含凭据头文件 `-H @file`，循环外建一次、EXIT trap 统一清理——防多分支推送时 trap 覆盖泄漏临时文件）。
+- **API 语义**：列表端点按 HTTP 状态码分流（401 坏 token/403 限流/404 错 slug → api-error 显式降级，不伪装成「无 PR」）；单次请求同时拿 body+状态（无 TOCTOU、省限流）；分支名全量 URL 编码；任一 open PR 优先、否则取 number 最大。
+- **钩子健壮性**：网络失败/查询失败/解析失败一律降级提示不硬拦（离线不卡推送），但全部显式可观测；exit 前经 trap 排空 stdin（防 git SIGPIPE 误报）。
+- 回归：open 放行 rc0 / merged 拦截 rc1 / 坏 token api-error rc0 / 无 token rc0 / 临时文件零残留。
+
+### README 审计补正（#178）
+
+- 工作流 5→8 条（补 ci.yml / bot-pr-merge.yml / warm-pragent-cache.yml）；`touchstone.yml` 描述补 gitleaks 前置。
+- 生产代码 8350 行/31 模块 → 12100 行/36 模块；覆盖率 93%→92%（均实测）。
+- gitleaks 双引擎（SEC-001 内置 + gitleaks 前置 relay）补全说明；`checks.yaml` 表项补 builtin/relay 语义；结构树补 `.gitleaks.toml`。
+- 版本示例 v0.2.2→v0.2.7；LLM_MODEL 建议值 glm-5.2→glm-5.3。
+
+### 经验库周更（#179）
+
+`chore(bot)`: experience store + ground truth 例行更新。
+
 ## [0.2.7] — 2026-08-13（gitleaks relay/CLI 修复 + SEC-001 去测试盲区 + 评审报告去冗余）
 
 本版本同步上游 AKDI-SE/touchstone v0.2.7（PR 编号引用上游 #172–#176；CPAT fork 对应本仓同步 PR）。
