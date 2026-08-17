@@ -290,3 +290,31 @@ def test_CHARACTERIZES_injected_engaged_flag_is_trusted_by_seam():
     assert out["engaged"] is True                        # seam 盲信了注入标志
     assert RP.review_reliable(out["engine_status"], 0, out["added_lines"], out["engaged"]) is True
 
+
+
+# ---- SEC-001 引擎数据文件（data/*.json）降级 warn（CPAT PR#10 同步大 diff 修复）----
+def test_sec001_engine_data_json_downgrades_to_warn():
+    """data/ground_truth.json 新增行含历史 diff 的凭据样例串 → warn 可见、不 block。
+
+    背景：真值集内容是历史 PR 的 diff 文本，diff 里合法包含评审讨论过的样例凭据
+    （如 SEC-001 自己的夹具 AKIAABCDEFGHIJKLMNOP）。block 会拦截正常数据更新。"""
+    added = {"data/ground_truth.json": [(57, '"diff": "...AWS = \\"AKIAABCDEFGHIJKLMNOP\\""')]}
+    f = contract_check.check_secrets(added, _rule_index())
+    assert len(f) == 1
+    assert f[0]["severity"] == "warn"
+    assert "降级 warn" in f[0]["rationale"]
+    assert "引擎数据文件" in f[0]["rationale"]
+
+
+def test_sec001_engine_data_must_be_under_data_dir():
+    """同内容不在 data/ 下 → 仍 block（降级只给引擎数据目录，不外溢）。"""
+    added = {"src/config.json": [(1, '"AKIAABCDEFGHIJKLMNOP"')]}
+    f = contract_check.check_secrets(added, _rule_index())
+    assert len(f) == 1
+    assert f[0]["severity"] == "block_candidate"
+
+
+def test_sec001_engine_data_placeholder_still_filtered():
+    """data/*.json 里占位值仍被过滤（降级 ≠ 不扫）。"""
+    added = {"data/experience_store.json": [(1, '"example AKIAEXAMPLESAMPLE1234"')]}
+    assert contract_check.check_secrets(added, _rule_index()) == []
