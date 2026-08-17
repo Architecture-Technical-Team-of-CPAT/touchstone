@@ -297,7 +297,7 @@ def test_sec001_engine_data_json_downgrades_to_warn():
     """data/ground_truth.json 新增行含历史 diff 的凭据样例串 → warn 可见、不 block。
 
     背景：真值集内容是历史 PR 的 diff 文本，diff 里合法包含评审讨论过的样例凭据
-    （如 SEC-001 自己的夹具 AKIAABCDEFGHIJKLMNOP）。block 会拦截正常数据更新。"""
+    （如 SEC-001 自己的夹具,20 位字母序样例串）。block 会拦截正常数据更新。"""
     added = {"data/ground_truth.json": [(57, '"diff": "...AWS = \\"AKIAABCDEFGHIJKLMNOP\\""')]}
     f = contract_check.check_secrets(added, _rule_index())
     assert len(f) == 1
